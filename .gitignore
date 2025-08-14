@@ -1,0 +1,11 @@
+﻿venv/
+.env
+*.pyc
+__pycache__/
+.cache/
+*.log
+.DS_Store
+Thumbs.db
+models/
+weights/
+checkpoints/
