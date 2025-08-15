@@ -1,420 +1,393 @@
 import io
 import os
+import sys
 import json
 import math
 import random
 import logging
-from io import BytesIO
-from typing import Optional
+from typing import Optional, Tuple
+from urllib.parse import urlparse
 
 import requests
-from PIL import Image, ImageOps
-from flask import Flask, request, jsonify, send_file
+from PIL import Image
 
 import torch
 from diffusers import StableDiffusionXLPipeline, StableDiffusionXLImg2ImgPipeline
+from diffusers.utils import load_image
 
-# -----------------------------------------------------------------------------
-# LOGGING
-# -----------------------------------------------------------------------------
-logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
+# --- logging ---------------------------------------------------------------
+logging.basicConfig(level=os.getenv("LOGLEVEL", "INFO"))
 log = logging.getLogger("api")
 
-# -----------------------------------------------------------------------------
-# ENV / CONFIG
-# -----------------------------------------------------------------------------
-DEVICE = "cuda" if torch.cuda.is_available() and os.getenv("DEVICE", "cuda") != "cpu" else "cpu"
+# --- config ---------------------------------------------------------------
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 DTYPE = torch.float16 if DEVICE == "cuda" else torch.float32
-MODEL_NAME = os.getenv("MODEL", "stabilityai/stable-diffusion-xl-base-1.0")
-MAX_W = int(os.getenv("MAX_W", "1536"))
-MAX_H = int(os.getenv("MAX_H", "1536"))
+MODEL_NAME = os.getenv("SDXL_MODEL", "stabilityai/stable-diffusion-xl-base-1.0")
+HF_HOME = os.getenv("HF_HOME", "/workspace/.cache/huggingface")
+os.environ["HF_HOME"] = HF_HOME
+os.environ["HUGGINGFACE_HUB_CACHE"] = HF_HOME
 
-# FaceID checkpoint (si existe, lo usamos)
-FACEID_CKPT = os.getenv("FACEID_CKPT", "/workspace/models/ipadapter/ip-adapter-faceid_sdxl.bin")
+# IP-Adapter vendor + checkpoint
+HAS_FACEID = False
+FACEID_CKPT = os.getenv(
+    "FACEID_CKPT",
+    "/workspace/models/ipadapter/ip-adapter-faceid_sdxl.bin"
+)
 
-# rembg opcional
+try:
+    # vendorizado: /srv/app/IP-Adapter/ip_adapter/...
+    from ip_adapter.ip_adapter_faceid import IPAdapterFaceID  # type: ignore
+    HAS_FACEID = True
+    log.info("✔ ip_adapter (FaceID) importado")
+except Exception as e:
+    HAS_FACEID = False
+    log.warning(f"ip_adapter no disponible: {e}")
+
+# rembg (para transparent background opcional)
 HAS_REMBG = False
 try:
     from rembg import remove as rembg_remove, new_session as rembg_new_session  # type: ignore
     _rembg_session = rembg_new_session("u2net")
     HAS_REMBG = True
+    log.info("✔ rembg listo")
 except Exception as e:
     log.warning(f"rembg no disponible: {e}")
     HAS_REMBG = False
 
-# IP-Adapter FaceID opcional
-HAS_FACEID = False
+# InsightFace para embeddings
+_HAS_INSIGHT = False
 try:
-    # Requiere que el paquete ip_adapter esté resolvible (p.ej. vía .pth en site-packages)
-    from ip_adapter.ip_adapter_faceid import IPAdapterFaceID  # type: ignore
-    HAS_FACEID = True
+    from insightface.app import FaceAnalysis  # type: ignore
+    _HAS_INSIGHT = True
+    log.info("✔ insightface importado")
 except Exception as e:
-    log.warning(f"ip_adapter (FaceID) no disponible: {e}")
-    HAS_FACEID = False
+    _HAS_INSIGHT = False
+    log.warning(f"insightface no disponible: {e}")
 
-# -----------------------------------------------------------------------------
-# HELPERS
-# -----------------------------------------------------------------------------
-def _clamp_size(w: int, h: int) -> tuple[int, int]:
-    w = max(64, min(MAX_W, int(w // 8 * 8)))
-    h = max(64, min(MAX_H, int(h // 8 * 8)))
-    return w, h
 
-def _load_pil_from_url(url: str) -> Image.Image:
-    # Algunos CDNs piden User-Agent
-    resp = requests.get(url, timeout=30, headers={"User-Agent": "curl/8.5"})
-    resp.raise_for_status()
-    img = Image.open(BytesIO(resp.content))
+# --- utilidades -----------------------------------------------------------
+def _fetch_image(url: str) -> Image.Image:
+    """Descarga imagen desde URL a PIL (RGBA si trae alpha)."""
+    r = requests.get(url, timeout=30)
+    r.raise_for_status()
+    img = Image.open(io.BytesIO(r.content)).convert("RGBA" if "A" in Image.open(io.BytesIO(r.content)).getbands() else "RGB")
     return img
 
-def _to_rgb_no_alpha(img: Image.Image) -> Image.Image:
-    # FaceID / pipelines esperan RGB (sin alpha)
-    if img.mode in ("RGBA", "LA"):
-        bg = Image.new("RGB", img.size, (255, 255, 255))
-        if img.mode == "RGBA":
-            bg.paste(img, mask=img.split()[-1])
-        else:
-            bg.paste(img.convert("RGB"))
-        return bg
-    return img.convert("RGB")
 
-def _square_center_crop(img: Image.Image, min_side: int = 512) -> Image.Image:
-    w, h = img.size
-    side = min(w, h)
-    left = (w - side) // 2
-    top = (h - side) // 2
-    img = img.crop((left, top, left + side, top + side))
-    if side < min_side:
-        img = img.resize((min_side, min_side), Image.LANCZOS)
+def _ensure_rgb(img: Image.Image) -> Image.Image:
+    if img.mode not in ("RGB", "RGBA"):
+        return img.convert("RGB")
     return img
 
-def _pil_to_png_bytes(img: Image.Image) -> bytes:
-    buf = io.BytesIO()
-    img.save(buf, format="PNG")
-    return buf.getvalue()
 
-# -----------------------------------------------------------------------------
-# PIPELINES (lazy singletons)
-# -----------------------------------------------------------------------------
-_base_pipe: Optional[StableDiffusionXLPipeline] = None
-_img2img_pipe: Optional[StableDiffusionXLImg2ImgPipeline] = None
-_faceid_adapter: Optional["IPAdapterFaceID"] = None
+def _maybe_transparent(png: Image.Image, want_transparent: bool) -> Image.Image:
+    if want_transparent:
+        # si ya viene RGBA lo dejamos, si no convertimos y pasamos rembg si existe
+        if png.mode != "RGBA":
+            png = png.convert("RGBA")
+        if HAS_REMBG:
+            try:
+                b = io.BytesIO()
+                png.save(b, format="PNG")
+                b.seek(0)
+                out = rembg_remove(b.getvalue(), session=_rembg_session)
+                return Image.open(io.BytesIO(out)).convert("RGBA")
+            except Exception as e:
+                log.warning(f"rembg fallo, continuo sin transparencia: {e}")
+        return png
+    else:
+        # forzamos RGB si no queremos transparencia
+        return png.convert("RGB")
 
-def get_base_pipe() -> StableDiffusionXLPipeline:
-    global _base_pipe
-    if _base_pipe is None:
-        log.info(f"⏳ Cargando SDXL: {MODEL_NAME} (device={DEVICE}, dtype={DTYPE})")
+
+# --- pipelínes ------------------------------------------------------------
+_base_txt2img: Optional[StableDiffusionXLPipeline] = None
+_base_img2img: Optional[StableDiffusionXLImg2ImgPipeline] = None
+_faceid_adapter: Optional[IPAdapterFaceID] = None
+_insight_app: Optional["FaceAnalysis"] = None  # type: ignore
+
+
+def get_txt2img() -> StableDiffusionXLPipeline:
+    global _base_txt2img
+    if _base_txt2img is None:
+        log.info(f"⏳ Cargando SDXL txt2img: {MODEL_NAME} ({DEVICE}, {DTYPE})")
         pipe = StableDiffusionXLPipeline.from_pretrained(
             MODEL_NAME,
             torch_dtype=DTYPE,
             use_safetensors=True,
+            add_watermarker=False,
         )
         if DEVICE == "cuda":
-            pipe.enable_model_cpu_offload()  # memoria
-        _base_pipe = pipe
+            pipe.enable_model_cpu_offload()
+        else:
+            pipe = pipe.to(DEVICE)
+        pipe.set_progress_bar_config(disable=False)
+        _base_txt2img = pipe
         log.info("✔ txt2img listo")
-    return _base_pipe
+    return _base_txt2img
 
-def get_img2img_pipe() -> StableDiffusionXLImg2ImgPipeline:
-    global _img2img_pipe
-    if _img2img_pipe is None:
-        log.info("⏳ Cargando SDXL img2img… (device=cuda)")
+
+def get_img2img() -> StableDiffusionXLImg2ImgPipeline:
+    global _base_img2img
+    if _base_img2img is None:
+        log.info(f"⏳ Cargando SDXL img2img… ({DEVICE})")
         pipe = StableDiffusionXLImg2ImgPipeline.from_pretrained(
             MODEL_NAME,
             torch_dtype=DTYPE,
             use_safetensors=True,
+            add_watermarker=False,
         )
         if DEVICE == "cuda":
             pipe.enable_model_cpu_offload()
-        _img2img_pipe = pipe
+        else:
+            pipe = pipe.to(DEVICE)
+        pipe.set_progress_bar_config(disable=False)
+        _base_img2img = pipe
         log.info("✔ img2img listo")
-    return _img2img_pipe
+    return _base_img2img
 
-def get_faceid_adapter(base_pipe: StableDiffusionXLPipeline) -> Optional["IPAdapterFaceID"]:
+
+def get_faceid_adapter() -> Optional[IPAdapterFaceID]:
+    """Crea el adaptador FaceID sólo si tenemos vendor + checkpoint y carga ok."""
     global _faceid_adapter
     if not HAS_FACEID:
         return None
     if not os.path.isfile(FACEID_CKPT):
-        log.warning("FACEID ckpt no encontrado; se usará img2img normal.")
+        log.warning("FACEID_CKPT no encontrado; FaceID deshabilitado.")
         return None
     if _faceid_adapter is None:
         try:
-            _faceid_adapter = IPAdapterFaceID(base_pipe, FACEID_CKPT, device=DEVICE)
+            base = get_txt2img()
+            _faceid_adapter = IPAdapterFaceID(base, FACEID_CKPT, device=DEVICE)
             log.info("✔ IP-Adapter FaceID listo")
         except Exception as e:
-            log.warning(f"No pude inicializar FaceID: {e}")
+            log.error(f"No pude inicializar FaceID: {e}")
             _faceid_adapter = None
     return _faceid_adapter
 
-# -----------------------------------------------------------------------------
-# CORE GENERATORS
-# -----------------------------------------------------------------------------
-def generate_txt2img(
-    prompt: str,
-    negative_prompt: str,
-    width: int,
-    height: int,
-    steps: int,
-    guidance: float,
-    seed: Optional[int],
-) -> Image.Image:
-    base = get_base_pipe()
-    g = None
-    if seed is not None:
-        g = torch.Generator(device=DEVICE).manual_seed(seed)
-    w, h = _clamp_size(width, height)
-    out = base(
-        prompt=prompt,
-        negative_prompt=(negative_prompt or None),
-        num_inference_steps=max(10, steps),
-        guidance_scale=guidance,
-        width=w,
-        height=h,
-        generator=g,
-    ).images[0]
-    return out
 
-def refine_with_img2img(
-    init_image: Image.Image,
-    prompt: str,
-    negative_prompt: str,
-    width: int,
-    height: int,
-    steps: int,
-    guidance: float,
-    strength: float,
-    seed: Optional[int],
-) -> Image.Image:
-    img2img = get_img2img_pipe()
-    g = None
-    if seed is not None:
-        g = torch.Generator(device=DEVICE).manual_seed(seed)
-    w, h = _clamp_size(width, height)
-    init = init_image.convert("RGB").resize((w, h), Image.LANCZOS)
-    out = img2img(
-        prompt=prompt,
-        negative_prompt=(negative_prompt or None),
-        image=init,
-        num_inference_steps=max(10, steps),
-        guidance_scale=guidance,
-        strength=min(0.95, max(0.01, strength)),
-        generator=g,
-    ).images[0]
-    return out
+def get_insight_app() -> Optional["FaceAnalysis"]:  # type: ignore
+    global _insight_app
+    if not _HAS_INSIGHT:
+        return None
+    if _insight_app is None:
+        providers = ["CUDAExecutionProvider", "CPUExecutionProvider"] if DEVICE == "cuda" else ["CPUExecutionProvider"]
+        try:
+            app = FaceAnalysis(name="buffalo_l", providers=providers)
+            app.prepare(ctx_id=0 if DEVICE == "cuda" else -1, det_size=(640, 640))
+            _insight_app = app
+            log.info("✔ InsightFace listo")
+        except Exception as e:
+            log.error(f"No pude preparar InsightFace: {e}")
+            _insight_app = None
+    return _insight_app
 
-def edit_with_headshot(
-    image_url: str,
-    prompt: str,
-    negative_prompt: str,
-    width: int,
-    height: int,
-    steps: int,
-    guidance: float,
-    strength: float,
-    identity_strength: float,
-    seed: Optional[int],
-) -> Image.Image:
-    """
-    Usa IP-Adapter FaceID si está disponible; si no, cae a img2img.
-    """
-    base = get_base_pipe()
-    adapter = get_faceid_adapter(base)
-    w, h = _clamp_size(width, height)
-    g_seed = seed if seed is not None else random.randint(1, 2**31 - 1)
 
-    # Cargar headshot de referencia
-    ref = _load_pil_from_url(image_url)
-    ref = _to_rgb_no_alpha(ref)
-    ref = _square_center_crop(ref, min_side=512)
+def compute_faceid_embedding(img_rgba_or_rgb: Image.Image) -> Optional[torch.Tensor]:
+    """Devuelve un tensor (1, dim) en CPU con el embedding facial, o None si no hay cara."""
+    app = get_insight_app()
+    if app is None:
+        return None
+    img = _ensure_rgb(img_rgba_or_rgb).convert("RGB")
+    # InsightFace espera numpy BGR, pero el wrapper `app.get` acepta RGB in PIL->numpy
+    import numpy as np  # local import garantizado (numpy<2 ya en venv)
+    arr = np.array(img)  # RGB
+    faces = app.get(arr)
+    if not faces:
+        return None
+    # Usamos la cara más grande
+    faces.sort(key=lambda f: (f.bbox[2]-f.bbox[0])*(f.bbox[3]-f.bbox[1]), reverse=True)
+    emb = faces[0].normed_embedding  # np.float32, shape (512,) típico
+    if emb is None:
+        return None
+    t = torch.from_numpy(np.asarray(emb, dtype=np.float32)).unsqueeze(0)  # (1,512)
+    return t
 
-    if adapter is not None:
-        log.info(f"➡️ FaceID | identity_strength={identity_strength:.2f}")
-        out = adapter.generate(
-            prompt=prompt,
-            negative_prompt=(negative_prompt or None),
-            num_samples=1,
-            width=w,
-            height=h,
-            num_inference_steps=max(10, steps),
-            guidance_scale=guidance,
-            seed=g_seed,
-            id_images=[ref],  # <— clave: calcular embeddings internamente
-            s_scale=max(0.1, min(1.0, identity_strength)),
-        )
-        img = out[0] if isinstance(out, (list, tuple)) else out
-        if not isinstance(img, Image.Image):
-            raise RuntimeError("FaceID devolvió un resultado inesperado")
-        # Refinado suave opcional para pulir detalles sin perder identidad
-        if strength and strength > 0:
-            img = refine_with_img2img(
-                init_image=img,
-                prompt=prompt,
-                negative_prompt=negative_prompt,
-                width=w,
-                height=h,
-                steps=max(10, steps // 2),
-                guidance=guidance,
-                strength=min(0.35, max(0.05, strength)),
-                seed=g_seed,
-            )
-        return img
 
-    # Fallback: img2img clásico
-    log.info("➡️ Fallback img2img (sin FaceID)")
-    init = ref.resize((w, h), Image.LANCZOS)
-    img = refine_with_img2img(
-        init_image=init,
-        prompt=prompt,
-        negative_prompt=negative_prompt,
-        width=w,
-        height=h,
-        steps=steps,
-        guidance=guidance,
-        strength=min(0.45, max(0.05, strength or 0.25)),
-        seed=g_seed,
-    )
-    return img
+# --- Flask app ------------------------------------------------------------
+from flask import Flask, request, Response, jsonify, send_file
 
-def remove_background(img: Image.Image) -> Image.Image:
-    if not HAS_REMBG:
-        return img  # sin rembg, devolvemos la original
-    try:
-        b = rembg_remove(img.convert("RGBA"), session=_rembg_session)
-        if isinstance(b, bytes):
-            b = Image.open(BytesIO(b)).convert("RGBA")
-        else:
-            b = b.convert("RGBA")
-        return b
-    except Exception as e:
-        log.warning(f"rembg falló: {e}")
-        return img
-
-# -----------------------------------------------------------------------------
-# FLASK APP
-# -----------------------------------------------------------------------------
 app = Flask(__name__)
 
-@app.route("/health", methods=["GET"])
+
+@app.get("/health")
 def health():
     return jsonify({
         "ok": True,
         "device": DEVICE,
         "model": MODEL_NAME,
         "has_rembg": HAS_REMBG,
-        "has_faceid": HAS_FACEID,
+        "has_faceid": bool(get_faceid_adapter() is not None)
     })
 
-@app.route("/generate", methods=["POST"])
+
+def _run_txt2img(prompt: str, negative: str, steps: int, guidance: float, w: int, h: int, seed: Optional[int]) -> Image.Image:
+    pipe = get_txt2img()
+    g = None
+    if seed is not None:
+        g = torch.Generator(device=pipe._execution_device).manual_seed(int(seed))
+    out = pipe(
+        prompt=prompt,
+        negative_prompt=negative or None,
+        num_inference_steps=int(steps),
+        guidance_scale=float(guidance),
+        height=int(h),
+        width=int(w),
+        generator=g
+    )
+    return out.images[0]
+
+
+def _run_img2img(init_image: Image.Image, prompt: str, negative: str, steps: int, guidance: float, strength: float, seed: Optional[int]) -> Image.Image:
+    pipe = get_img2img()
+    g = None
+    if seed is not None:
+        g = torch.Generator(device=pipe._execution_device).manual_seed(int(seed))
+    out = pipe(
+        image=init_image,
+        prompt=prompt,
+        negative_prompt=negative or None,
+        strength=float(strength),
+        num_inference_steps=int(steps),
+        guidance_scale=float(guidance),
+        generator=g
+    )
+    return out.images[0]
+
+
+def _run_faceid(headshot: Image.Image, prompt: str, negative: str, steps: int, guidance: float, w: int, h: int, seed: Optional[int], identity_strength: float) -> Optional[Image.Image]:
+    """Genera con IP‑Adapter FaceID. Si falla embedding, devuelve None."""
+    adapter = get_faceid_adapter()
+    if adapter is None:
+        return None
+
+    # 1) embedding
+    embeds = compute_faceid_embedding(headshot)
+    if embeds is None:
+        log.error("No se detectó cara en el headshot (FaceID).")
+    else:
+        log.info(f"✔ embedding de cara obtenido: shape={tuple(embeds.shape)}")
+
+    # 2) generator/seed
+    gen = None
+    base = get_txt2img()
+    if seed is not None:
+        gen = torch.Generator(device=base._execution_device).manual_seed(int(seed))
+
+    # 3) ip_adapter_scale mapea a identidad
+    ip_scale = float(max(0.0, min(1.0, identity_strength)))
+
+    # 4) El FaceID oficial acepta `faceid_embeds` cuando no pasas `image`.
+    #    Si no hay embeds, devolvemos None para que el caller haga fallback.
+    if embeds is None:
+        return None
+
+    out = adapter.generate(
+        prompt=prompt,
+        negative_prompt=negative or None,
+        faceid_embeds=embeds,           # <── lo clave para evitar el NoneType
+        num_inference_steps=int(steps),
+        guidance_scale=float(guidance),
+        height=int(h),
+        width=int(w),
+        ip_adapter_scale=ip_scale,
+        generator=gen
+    )
+    # Algunos forks devuelven PIL directamente, otros dict
+    if isinstance(out, Image.Image):
+        return out
+    if hasattr(out, "images"):
+        return out.images[0]
+    if isinstance(out, (list, tuple)) and len(out) > 0 and isinstance(out[0], Image.Image):
+        return out[0]
+    return None
+
+
+def _png_bytes(img: Image.Image) -> bytes:
+    b = io.BytesIO()
+    img.save(b, format="PNG")
+    return b.getvalue()
+
+
+@app.post("/generate")
 def generate():
     """
     JSON:
-      - prompt (str) [requerido]
-      - negative_prompt (str)
-      - width, height (int)
-      - steps (int)
-      - guidance (float)
-      - seed (int)
-      - transparent (bool)
-      - return: "json" | "png" | "bytes" (default: "json")
-      - image_url (str) -> si viene, intentamos FaceID; si no hay, fallback img2img
-      - identity_strength (float 0..1) -> FaceID
-      - strength (float 0..1) -> refinado img2img
+      prompt, negative_prompt, width, height, steps, guidance, seed,
+      transparent (bool), return: "bytes"|"base64"|"url",
+      image_url (opcional),
+      strength (img2img), identity_strength (FaceID)
     """
     try:
         data = request.get_json(force=True, silent=False)
     except Exception:
         return jsonify({"ok": False, "error": "JSON inválido"}), 400
 
-    prompt = (data.get("prompt") or "").strip()
-    if not prompt:
-        return jsonify({"ok": False, "error": "prompt requerido"}), 400
-
-    negative_prompt = (data.get("negative_prompt") or "").strip()
-    width = int(data.get("width", 1024))
-    height = int(data.get("height", 1024))
+    prompt = str(data.get("prompt", "")).strip()
+    negative = str(data.get("negative_prompt", "")).strip()
+    w = int(data.get("width", 1024))
+    h = int(data.get("height", 1024))
     steps = int(data.get("steps", 30))
     guidance = float(data.get("guidance", 7.5))
     seed = data.get("seed", None)
-    if seed is not None:
-        seed = int(seed)
-    transparent = bool(data.get("transparent", False))
-    ret = (data.get("return") or "json").lower()
-    image_url = (data.get("image_url") or "").strip()
-    identity_strength = float(data.get("identity_strength", 0.9))
-    strength = float(data.get("strength", 0.15))
+    seed = int(seed) if seed is not None else None
+    want_transparent = bool(data.get("transparent", False))
+    ret_kind = data.get("return", "bytes")
 
-    log.info(
-        f"➡️ Generando | steps={steps} guide={guidance:.2f} size={width}x{height} transparent={transparent} "
-        f"seed={seed} image_url={'yes' if image_url else 'no'} faceid={HAS_FACEID}"
-    )
+    image_url = data.get("image_url", "").strip()
+    strength = float(data.get("strength", 0.25))
+    identity_strength = float(data.get("identity_strength", 0.0))
 
-    try:
-        if image_url:
-            img = edit_with_headshot(
-                image_url=image_url,
+    # --- ruta de decisión ---
+    img: Optional[Image.Image] = None
+
+    # 1) FaceID si hay headshot + identity_strength>0 + FaceID disponible
+    if image_url and identity_strength > 0.0 and (get_faceid_adapter() is not None):
+        try:
+            ref = _fetch_image(image_url)
+            log.info(f"➡️ FaceID | identity_strength={identity_strength:.2f}")
+            img = _run_faceid(
+                headshot=ref,
                 prompt=prompt,
-                negative_prompt=negative_prompt,
-                width=width,
-                height=height,
+                negative=negative,
                 steps=steps,
                 guidance=guidance,
-                strength=strength,
-                identity_strength=identity_strength,
+                w=w, h=h,
                 seed=seed,
+                identity_strength=identity_strength
             )
-        else:
-            img = generate_txt2img(
-                prompt=prompt,
-                negative_prompt=negative_prompt,
-                width=width,
-                height=height,
-                steps=steps,
-                guidance=guidance,
-                seed=seed,
-            )
+            if img is None:
+                log.warning("FaceID falló o no detectó cara; hago fallback a img2img suave")
+                # Fallback a img2img (para no dejar al cliente sin imagen)
+                init = _ensure_rgb(ref).resize((w, h), Image.LANCZOS)
+                img = _run_img2img(init, prompt, negative, steps, guidance, strength=max(0.05, min(0.35, strength)), seed=seed)
+        except Exception as e:
+            log.exception("edit fallo")
+            return jsonify({"ok": False, "error": str(e)}), 500
 
-        if transparent:
-            img = remove_background(img)
-            # Asegura RGBA si pedimos transparencia
-            if img.mode != "RGBA":
-                img = img.convert("RGBA")
-        else:
-            img = img.convert("RGB")
+    # 2) img2img si hay image_url (y NO FaceID)
+    elif image_url:
+        ref = _fetch_image(image_url)
+        init = _ensure_rgb(ref).resize((w, h), Image.LANCZOS)
+        img = _run_img2img(init, prompt, negative, steps, guidance, strength=strength, seed=seed)
 
-        if ret == "png":
-            # Devuelve imagen directa
-            bio = io.BytesIO()
-            img.save(bio, format="PNG")
-            bio.seek(0)
-            return send_file(bio, mimetype="image/png")
+    # 3) txt2img directo
+    else:
+        img = _run_txt2img(prompt, negative, steps, guidance, w, h, seed)
 
-        # default: json o bytes
-        png_bytes = _pil_to_png_bytes(img)
-        if ret == "bytes":
-            return send_file(
-                io.BytesIO(png_bytes),
-                mimetype="image/png",
-                as_attachment=False,
-                download_name="image.png",
-            )
+    # transparencia opcional (al final)
+    img = _maybe_transparent(img, want_transparent)
 
-        # JSON con tamaño + base64 opcional (apagado por defecto para no inflar)
-        return jsonify({
-            "ok": True,
-            "bytes": len(png_bytes),
-            "seed": seed if seed is not None else None,
-        })
-    except Exception as e:
-        log.exception("generate falló")
-        return jsonify({"ok": False, "error": str(e)}), 500
+    # respuesta
+    if ret_kind == "bytes":
+        payload = _png_bytes(img)
+        return Response(payload, mimetype="image/png")
+    else:
+        # Para mantener compatibilidad — devolvemos stats simples
+        b = _png_bytes(img)
+        return jsonify({"ok": True, "bytes": len(b), "seed": seed})
 
-
-# For RunPod health check root
-@app.route("/", methods=["GET"])
-def root():
-    return jsonify({"ok": True, "service": "stable-face-api"})
-
-
-# Desarrollo local
+# -------------------------------------------------------------------------
+# Arranque local (útil si corres `python api.py` dentro del Pod)
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "3000")))
