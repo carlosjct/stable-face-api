@@ -1,51 +1,60 @@
-import os, pathlib
-from flask import Flask, jsonify, request
+# --- deps arriba del archivo (asegúrate de tenerlos) ---
+import io
+from flask import send_file, request
 
-app = Flask(__name__)
+# ...
 
-@app.get("/health")
-def health():
-    return jsonify({"status": "ok", "faceid_enabled": bool(os.getenv("USE_FACEID", "1") == "1")})
-
-# --- config ---
-USE_FACEID = os.getenv("USE_FACEID", "1") == "1"
-IP_FACEID_PATH = os.getenv("IP_ADAPTER_FACEID_PATH", "/workspace/models/ipadapter/ip-adapter-faceid_sdxl.bin")
-DEVICE = "cuda"  # o "cpu" si quieres forzar
-
-# --- lazy load ---
-pipe = None
-ip_adapter = None
-
-def load_pipe():
-    global pipe
-    if pipe is not None:
-        return pipe
-    print("⏳ Cargando SDXL...", flush=True)
-    # TODO: importa y crea el pipeline aquí, con enable_model_cpu_offload() si usas GPU pequeña
-    # pipe = StableDiffusionXLPipeline.from_pretrained(...).to(DEVICE)
-    return pipe
-
-def load_faceid_adapter():
-    global ip_adapter
-    if ip_adapter is not None:
-        return ip_adapter
-    if not USE_FACEID:
-        print("⚠️ USE_FACEID=0 → no se cargará FaceID", flush=True)
-        return None
-    if not os.path.isfile(IP_FACEID_PATH):
-        print(f"⚠️ Peso FaceID no encontrado en {IP_FACEID_PATH}. Arrancando sin FaceID.", flush=True)
-        return None
-    print("⏳ Cargando IP-Adapter FaceID...", flush=True)
-    p = load_pipe()
-    from ip_adapter.ip_adapter_faceid import IPAdapterFaceID
-    ip_adapter = IPAdapterFaceID(p, IP_FACEID_PATH, device=DEVICE)
-    return ip_adapter
+def pil_to_png_bytes(img) -> io.BytesIO:
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    buf.seek(0)
+    return buf
 
 @app.post("/generate")
 def generate():
-    p = load_pipe()
-    fa = load_faceid_adapter()  # puede ser None y seguimos
-    data = request.get_json(force=True)
-    prompt = data.get("prompt", "a photo")
-    # TODO: usa p (y fa si no es None) para generar
-    return jsonify({"ok": True, "used_faceid": fa is not None})
+    data = request.get_json(force=True) or {}
+    prompt   = data.get("prompt", "a photo of a cat")
+    negative = data.get("negative_prompt", "")
+    steps    = int(data.get("steps", 25))
+    guidance = float(data.get("guidance", 7.0))
+    width    = int(data.get("width", 1024))
+    height   = int(data.get("height", 1024))
+    seed     = data.get("seed")
+
+    # carga perezosa de pipeline y (opcional) faceid
+    p  = load_pipe()
+    _  = load_faceid()  # puede ser None; no detiene generación
+
+    gen = torch.Generator(device=DEVICE)
+    if seed is not None:
+        gen = gen.manual_seed(int(seed))
+
+    # autocast para GPU si está disponible
+    if DEVICE == "cuda":
+        cm = torch.autocast("cuda")
+    else:
+        from contextlib import nullcontext
+        cm = nullcontext()
+
+    with torch.no_grad(), cm:
+        out = p(
+            prompt=prompt,
+            negative_prompt=negative,
+            num_inference_steps=steps,
+            guidance_scale=guidance,
+            width=width,
+            height=height,
+            generator=gen,
+        )
+        img = out.images[0]
+
+    # responde bytes PNG directamente
+    png_bytes = pil_to_png_bytes(img)
+    # filename opcional (el navegador lo muestra inline igualmente)
+    return send_file(
+        png_bytes,
+        mimetype="image/png",
+        as_attachment=False,
+        download_name="result.png",
+        max_age=0,  # evita cache en proxies
+    )
