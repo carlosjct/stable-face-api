@@ -5,18 +5,21 @@ echo "=========="
 echo "== BOOT =="
 echo "=========="
 
-# 0) Paquetes base del sistema
+# --- Paquetes base ---
 apt-get update -y
 apt-get install -y --no-install-recommends git wget unzip ca-certificates
 update-ca-certificates
 
-# 1) Parámetros
 APP_DIR=${APP_DIR:-/srv/app}
 REPO_URL=${GIT_REPO:-https://github.com/carlosjct/stable-face-api.git}
 REPO_BRANCH=${GIT_BRANCH:-main}
 VENV=/opt/venv
 
-# 2) venv + Python deps (pin de numpy para compat)
+# ==== MODELO FOTORREALISTA XL ====
+# Puedes cambiarlo por otro luego vía env MODEL_NAME
+MODEL_NAME=${MODEL_NAME:-"SG161222/RealVisXL_V4.0"}
+
+# --- venv + deps pinneadas (Numpy<2, Torch cu118) ---
 if [ ! -x "$VENV/bin/python" ]; then
   python3 -m venv "$VENV"
   "$VENV/bin/pip" install --upgrade pip
@@ -25,11 +28,11 @@ if [ ! -x "$VENV/bin/python" ]; then
     torch==2.0.1+cu118 torchvision==0.15.2+cu118 torchaudio==2.0.2+cu118
 fi
 
-# 3) Traer código
+# --- Código de la app ---
 rm -rf "$APP_DIR"
 git clone --depth=1 --branch "$REPO_BRANCH" "$REPO_URL" "$APP_DIR"
 
-# 4) Instalar requirements (si existe), y asegurar extras para FaceID/rembg
+# --- Python deps (si no hay requirements, instala mínimos necesarios) ---
 REQ="$APP_DIR/requirements.txt"
 if [ -f "$REQ" ]; then
   "$VENV/bin/pip" install --no-cache-dir -r "$REQ"
@@ -40,14 +43,14 @@ else
     einops==0.7.0 timm==0.9.16 insightface==0.7.3 onnxruntime==1.16.3 rembg==2.0.50
 fi
 
-# 5) Asegurar paquete ip_adapter (vendor o descargar)
+# --- IP-Adapter (vendor o descarga oficial) ---
 PKG_ROOT=""
 if [ -d "$APP_DIR/IP-Adapter/ip_adapter" ]; then
   PKG_ROOT="$APP_DIR/IP-Adapter"
 elif [ -d "$APP_DIR/IP-Adapter/src/ip_adapter" ]; then
   PKG_ROOT="$APP_DIR/IP-Adapter/src"
 else
-  echo "⚠️  No hay IP-Adapter en el repo, descargando de tencent-ailab…"
+  echo "⚠️  No hay IP-Adapter en el repo, descargando…"
   mkdir -p "$APP_DIR/_vendor"
   cd "$APP_DIR/_vendor"
   wget -q https://github.com/tencent-ailab/IP-Adapter/archive/refs/heads/main.zip -O ipadapter.zip
@@ -57,14 +60,12 @@ else
     cp -r IP-Adapter-main/ip_adapter "$APP_DIR/IP-Adapter/"
   elif [ -d IP-Adapter-main/src/ip_adapter ]; then
     cp -r IP-Adapter-main/src/ip_adapter "$APP_DIR/IP-Adapter/"
-  else
-    echo "❌ ZIP de IP-Adapter sin ip_adapter/"
   fi
   PKG_ROOT="$APP_DIR/IP-Adapter"
   cd "$APP_DIR"
 fi
 
-# 6) Registrar ip_adapter en site-packages
+# --- Registrar 'ip_adapter' en site-packages ---
 SP=$("$VENV/bin/python" - <<'PY'
 import site
 c=[p for p in site.getsitepackages() if p.endswith("site-packages")]
@@ -74,12 +75,12 @@ PY
 if [ -n "$PKG_ROOT" ] && [ -d "$PKG_ROOT/ip_adapter" ]; then
   echo "$PKG_ROOT" > "$SP/ip_adapter.pth"
   chmod 644 "$SP/ip_adapter.pth"
-  echo "✔ ip_adapter registrado en $SP/ip_adapter.pth → $PKG_ROOT"
+  echo "✔ ip_adapter registrado en $SP/ip_adapter.pth"
 else
-  echo "⚠️  ip_adapter no encontrado; FaceID puede no funcionar"
+  echo "⚠️  ip_adapter no encontrado (FaceID podría no funcionar)"
 fi
 
-# 7) Descargar checkpoint FaceID si no existe
+# --- Descargar FaceID ckpt si no existe ---
 FACE_DIR=/workspace/models/ipadapter
 FACE_BIN=${FACEID_CKPT:-$FACE_DIR/ip-adapter-faceid_sdxl.bin}
 mkdir -p "$FACE_DIR"
@@ -89,7 +90,10 @@ if [ ! -s "$FACE_BIN" ]; then
 fi
 export FACEID_CKPT="$FACE_BIN"
 
-# 8) Arrancar API
+# --- Exportar el modelo fotorrealista al API ---
+export MODEL_NAME
+
+# --- Arrancar API ---
 cd "$APP_DIR"
 MOD=$(ls | grep -E "^(api|app|main)\.py$" | head -n1 | sed 's/\.py$//')
 OBJ=$("$VENV/bin/python" - <<PY
@@ -99,9 +103,6 @@ m = importlib.util.module_from_spec(s); s.loader.exec_module(m)
 print("app" if hasattr(m,"app") else ("application" if hasattr(m,"application") else ""))
 PY
 )
-if [ -z "$OBJ" ]; then
-  echo "❌ No se encontró Flask app (app/application) en $MOD.py"
-  exit 1
-fi
-echo "🚀 arrancando $MOD:$OBJ"
+[ -z "$OBJ" ] && { echo "❌ No Flask app en $MOD.py"; exit 1; }
+echo "🚀 arrancando $MOD:$OBJ (modelo: $MODEL_NAME)"
 exec "$VENV/bin/gunicorn" -w 1 -k gthread --threads 8 -b 0.0.0.0:3000 "$MOD:$OBJ"
