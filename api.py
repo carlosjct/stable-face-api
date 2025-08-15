@@ -69,6 +69,7 @@ def _load_base() -> StableDiffusionXLPipeline:
             MODEL_NAME,
             torch_dtype=DTYPE,
             use_safetensors=True,
+            variant="fp16",   
         )
         pipe.scheduler = DPMSolverMultistepScheduler.from_config(pipe.scheduler.config)
         if DEVICE == "cuda":
@@ -87,6 +88,7 @@ def _load_img2img() -> StableDiffusionXLImg2ImgPipeline:
             REFINER_NAME,
             torch_dtype=DTYPE,
             use_safetensors=True,
+            variant="fp16",   
         )
         p.scheduler = DPMSolverMultistepScheduler.from_config(p.scheduler.config)
         if DEVICE == "cuda":
