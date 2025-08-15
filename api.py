@@ -40,7 +40,7 @@ log = logging.getLogger("api")
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 DTYPE = torch.float16 if DEVICE == "cuda" else torch.float32
 
-MODEL_NAME = os.getenv("SDXL_MODEL", "SG161222/RealVisXL_V5.0")
+MODEL_NAME = os.getenv("SDXL_MODEL", "SG161222/ProteusV0.3")
 REFINER_NAME = os.getenv("SDXL_REFINER", "stabilityai/stable-diffusion-xl-refiner-1.0")
 USE_REFINER = os.getenv("USE_REFINER", "1") == "1"
 
