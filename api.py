@@ -1,3 +1,4 @@
+
 import io
 import os
 import math
@@ -12,7 +13,7 @@ import requests
 import torch
 from diffusers import (
     StableDiffusionXLPipeline,
-    StableDiffusionXLImg2ImgPipeline,  # << usamos esto como refiner
+    StableDiffusionXLImg2ImgPipeline,  # refiner / img2img
     DPMSolverMultistepScheduler,
     EulerAncestralDiscreteScheduler,
     AutoencoderKL,
@@ -30,7 +31,6 @@ except Exception:
 # ---- IP-Adapter FaceID vendorizado (opcional) ----
 HAS_FACEID = False
 try:
-    # requiere que tu repo tenga /IP-Adapter/ip_adapter/*
     from ip_adapter.ip_adapter_faceid import IPAdapterFaceID  # type: ignore
     HAS_FACEID = True
 except Exception:
@@ -46,7 +46,7 @@ MODEL_NAME = os.getenv("SDXL_MODEL", "SG161222/RealVisXL_V4.0")
 REFINER_NAME = os.getenv("SDXL_REFINER", "stabilityai/stable-diffusion-xl-refiner-1.0")
 USE_REFINER = os.getenv("USE_REFINER", "1") == "1"
 
-# VAE compartido para base y refiner
+# VAE compartido
 SDXL_VAE = os.getenv("SDXL_VAE", "madebyollin/sdxl-vae-fp16-fix")
 
 # pesos FaceID (opcional)
@@ -65,8 +65,6 @@ _base: Optional[StableDiffusionXLPipeline] = None
 _img2img: Optional[StableDiffusionXLImg2ImgPipeline] = None
 _faceid: Optional["IPAdapterFaceID"] = None  # type: ignore
 
-
-
 _vae = None
 def _load_vae():
     global _vae
@@ -82,11 +80,14 @@ def _load_vae():
         _vae = _vae_local
         log.info("✔ VAE listo")
     return _vae
+
 def _load_base() -> StableDiffusionXLPipeline:
     global _base
     if _base is None:
         log.info(f"⏳ Cargando SDXL base: {MODEL_NAME} (device={DEVICE})")
-        pipe = StableDiffusionXLPipeline.from_pretrained(MODEL_NAME, torch_dtype=DTYPE, use_safetensors=True, variant="fp16", vae=_load_vae())
+        pipe = StableDiffusionXLPipeline.from_pretrained(
+            MODEL_NAME, torch_dtype=DTYPE, use_safetensors=True, variant="fp16", vae=_load_vae()
+        )
         pipe.scheduler = EulerAncestralDiscreteScheduler.from_config(pipe.scheduler.config)
         if DEVICE == "cuda":
             pipe.enable_model_cpu_offload()
@@ -95,12 +96,13 @@ def _load_base() -> StableDiffusionXLPipeline:
         log.info("✔ txt2img listo")
     return _base
 
-
 def _load_img2img() -> StableDiffusionXLImg2ImgPipeline:
     global _img2img
     if _img2img is None:
         log.info(f"⏳ Cargando SDXL img2img / refiner: {REFINER_NAME} (device={DEVICE})")
-        p = StableDiffusionXLImg2ImgPipeline.from_pretrained(REFINER_NAME, torch_dtype=DTYPE, use_safetensors=True, variant="fp16", vae=_load_vae())
+        p = StableDiffusionXLImg2ImgPipeline.from_pretrained(
+            REFINER_NAME, torch_dtype=DTYPE, use_safetensors=True, variant="fp16", vae=_load_vae()
+        )
         p.scheduler = EulerAncestralDiscreteScheduler.from_config(p.scheduler.config)
         if DEVICE == "cuda":
             p.enable_model_cpu_offload()
@@ -108,7 +110,6 @@ def _load_img2img() -> StableDiffusionXLImg2ImgPipeline:
         _img2img = p
         log.info("✔ img2img listo")
     return _img2img
-
 
 def _load_faceid_adapter(base_pipe: StableDiffusionXLPipeline) -> Optional["IPAdapterFaceID"]:
     global _faceid
@@ -126,17 +127,14 @@ def _load_faceid_adapter(base_pipe: StableDiffusionXLPipeline) -> Optional["IPAd
             _faceid = None
     return _faceid
 
-
 def _fetch_image(url: str, size: Tuple[int, int]) -> Image.Image:
     r = requests.get(url, timeout=30)
     r.raise_for_status()
     img = Image.open(io.BytesIO(r.content)).convert("RGB")
-    # rellenamos/crop cuadrado simple para SDXL
     img = ImageOps.contain(img, size, method=Image.LANCZOS)
     bg = Image.new("RGB", size, (255, 255, 255))
     bg.paste(img, ((size[0] - img.width) // 2, (size[1] - img.height) // 2))
     return bg
-
 
 REALISM_ADD = (
     "ultra realistic, photorealistic, 8k, professional studio photography, "
@@ -144,20 +142,16 @@ REALISM_ADD = (
     "soft diffused lighting, sharp focus on eyes, subtle depth of field, "
     "no cgi, no 3d render, no cartoon"
 )
-
 REALISM_NEG = (
     "cgi, 3d render, cartoon, illustration, painting, plastic skin, waxy skin, "
     "over-smooth, over-sharpen, low quality, artifacts, text, watermark, extra fingers, "
     "cropped face, disfigured, deformed"
 )
 
-
 def _compose_prompts(prompt: str, negative_prompt: str) -> Tuple[str, str]:
     p = f"{prompt}, {REALISM_ADD}" if prompt else REALISM_ADD
     n = f"{negative_prompt}, {REALISM_NEG}" if negative_prompt else REALISM_NEG
-    # evitar que se pase de largo (SDXL CLIP-1 tiene límite ~77 tokens)
     return p[:1800], n[:1800]
-
 
 def _maybe_transparent(img: Image.Image, make_transparent: bool) -> Image.Image:
     if not make_transparent:
@@ -171,7 +165,6 @@ def _maybe_transparent(img: Image.Image, make_transparent: bool) -> Image.Image:
         log.warning(f"rembg falló: {e}")
         return img
 
-
 def _to_response(img: Image.Image, as_bytes: bool, fmt: str = "PNG"):
     buf = io.BytesIO()
     fmt = (fmt or "PNG").upper()
@@ -181,9 +174,8 @@ def _to_response(img: Image.Image, as_bytes: bool, fmt: str = "PNG"):
     img.save(buf, format=fmt, **save_kwargs)
     buf.seek(0)
     if as_bytes:
-        return buf  # el caller devuelve JSON con tamaño; o binario si ?format=png
+        return buf
     return send_file(buf, mimetype=f"image/{fmt.lower()}")
-
 
 @app.get("/health")
 def health():
@@ -195,7 +187,6 @@ def health():
         "has_rembg": HAS_REMBG,
         "has_faceid": HAS_FACEID and os.path.isfile(FACEID_CKPT),
     })
-
 
 @dataclass
 class GenParams:
@@ -211,7 +202,10 @@ class GenParams:
     image_url: Optional[str]
     strength: float
     identity_strength: float
-
+    # NUEVO: ajuste de pose sólo con texto (opcional)
+    pose_prompt: Optional[str] = None
+    pose_strength: float = 0.15     # fuerza del paso img2img de pose
+    pose_steps: int = 20            # pasos del paso de pose
 
 def _parse_json() -> GenParams:
     j = request.get_json(force=True, silent=True) or {}
@@ -228,8 +222,10 @@ def _parse_json() -> GenParams:
         image_url=j.get("image_url"),
         strength=float(j.get("strength", 0.20)),
         identity_strength=float(j.get("identity_strength", 0.85)),
+        pose_prompt=j.get("pose_prompt"),
+        pose_strength=float(j.get("pose_strength", 0.15)),
+        pose_steps=int(j.get("pose_steps", 20)),
     )
-
 
 def _apply_refiner_if_needed(img: Image.Image, prompt: str, negative_prompt: str, steps: int, guidance: float) -> Image.Image:
     if not USE_REFINER:
@@ -241,12 +237,11 @@ def _apply_refiner_if_needed(img: Image.Image, prompt: str, negative_prompt: str
             prompt=p,
             negative_prompt=n,
             image=img,
-            strength=0.10,       # refinado suave
+            strength=0.10,
             num_inference_steps=max(10, steps // 2),
             guidance_scale=guidance,
         )
     return out.images[0]
-
 
 def _txt2img(params: GenParams) -> Image.Image:
     base = _load_base()
@@ -270,35 +265,28 @@ def _txt2img(params: GenParams) -> Image.Image:
     img = _maybe_transparent(img, params.transparent)
     return img
 
-
 def _edit_with_faceid(params: GenParams) -> Optional[Image.Image]:
-    """Usa IP-Adapter FaceID si está disponible; si falla, devuelve None."""
     base = _load_base()
     adapter = _load_faceid_adapter(base)
     if adapter is None:
         return None
-
     try:
         src = _fetch_image(params.image_url, (params.width, params.height))
     except Exception as e:
         log.warning(f"No pude descargar image_url: {e}")
         return None
-
     p, n = _compose_prompts(params.prompt, params.negative_prompt)
     g = None
     if params.seed is not None:
         g = torch.Generator(device=DEVICE).manual_seed(int(params.seed))
-
-    # Mapeo: más identidad -> más “peso” del adapter; strength controla variación
     faceid_scale = max(0.1, min(1.2, params.identity_strength * 1.2))
     img2img_strength = max(0.05, min(0.6, params.strength))
-
     log.info(f"➡️ FaceID | identity={params.identity_strength:.2f} (scale={faceid_scale:.2f}) strength={img2img_strength:.2f}")
     with torch.inference_mode():
         out = adapter.generate(
             prompt=p,
             negative_prompt=n,
-            image_pil=src,               # el adapter extrae los embeddings FaceID internamente
+            image_pil=src,
             scale=faceid_scale,
             num_inference_steps=params.steps,
             guidance_scale=params.guidance,
@@ -307,25 +295,21 @@ def _edit_with_faceid(params: GenParams) -> Optional[Image.Image]:
             height=params.height,
         )
     img = out.images[0]
-
-    # refinado ligero
+    # Ajuste de pose opcional (texto) ANTES del refiner
+    img = _apply_pose_tweak_if_requested(img, params)
+    # Refiner y transparencia
     img = _apply_refiner_if_needed(img, p, n, params.steps, params.guidance)
-
-    # opcional transparencia
     img = _maybe_transparent(img, params.transparent)
     return img
 
-
 def _img2img_plain(params: GenParams) -> Optional[Image.Image]:
-    """Fallback cuando no hay FaceID: simple img2img para preservar identidad."""
     src = _fetch_image(params.image_url, (params.width, params.height))
     p, n = _compose_prompts(params.prompt, params.negative_prompt)
     g = None
     if params.seed is not None:
         g = torch.Generator(device=DEVICE).manual_seed(int(params.seed))
-
     pipe = _load_img2img()
-    strength = max(0.05, min(0.6, params.strength))  # bajo para preservar rasgos
+    strength = max(0.05, min(0.6, params.strength))
     log.info(f"➡️ Img2Img | strength={strength:.2f}")
     with torch.inference_mode():
         out = pipe(
@@ -338,39 +322,44 @@ def _img2img_plain(params: GenParams) -> Optional[Image.Image]:
             generator=g,
         )
     img = out.images[0]
+    img = _apply_pose_tweak_if_requested(img, params)
     img = _maybe_transparent(img, params.transparent)
     return img
 
+# -------- NUEVO: ajuste de pose sólo texto (pequeño img2img) --------
+POSE_NEG = "straight gaze, looking at camera, head straight"
+
+def _apply_pose_tweak_if_requested(img: Image.Image, params: GenParams) -> Image.Image:
+    if not params.pose_prompt:
+        return img
+    pipe = _load_img2img()
+    # Combinamos prompt con indicaciones de pose, y reforzamos el negativo típico que compite
+    pose_p = f"{params.pose_prompt}"
+    pose_n = f"{POSE_NEG}, {params.negative_prompt}" if params.negative_prompt else POSE_NEG
+    steps = max(10, int(params.pose_steps))
+    strength = max(0.05, min(0.35, float(params.pose_strength)))  # bajo para no destruir identidad
+    log.info(f"↪️ Pose tweak | strength={strength:.2f} steps={steps} prompt='{pose_p}'")
+    with torch.inference_mode():
+        out = pipe(
+            prompt=pose_p,
+            negative_prompt=pose_n,
+            image=img,
+            strength=strength,
+            num_inference_steps=steps,
+            guidance_scale=max(5.0, params.guidance),  # un poco más de guide ayuda a obedecer
+        )
+    return out.images[0]
 
 @app.post("/generate")
 def generate():
-    """
-    JSON:
-    {
-      "prompt": "...",
-      "negative_prompt": "...",
-      "width": 1024, "height": 1024,
-      "steps": 30, "guidance": 7.5,
-      "seed": 42,
-      "transparent": true,
-      "image_url": "https://.../headshot.png",    # opcional
-      "strength": 0.20,                           # img2img / FaceID variación
-      "identity_strength": 0.90,                  # FaceID: 0..1 (más = más parecido)
-      "return": "bytes"                           # si quieres binario en JSON (tamaño)
-    }
-    """
     try:
         params = _parse_json()
-
         if params.image_url:
-            # FaceID si disponible; si falla, plain img2img
             img = _edit_with_faceid(params)
             if img is None:
                 img = _img2img_plain(params)
         else:
             img = _txt2img(params)
-
-        # ¿Retorno como bytes o respuesta HTTP image/png?
         fmt = request.args.get("format", "png")
         if params.ret_bytes:
             blob = _to_response(img, as_bytes=True, fmt=fmt)
@@ -380,7 +369,6 @@ def generate():
     except Exception as e:
         log.exception("generate falló")
         return jsonify({"ok": False, "error": str(e)}), 500
-
 
 if __name__ == "__main__":
     app.run("0.0.0.0", 3000, debug=False)
