@@ -271,49 +271,73 @@ def _txt2img(params: GenParams) -> Image.Image:
     return img
 
 
+
 def _edit_with_faceid(params: GenParams) -> Optional[Image.Image]:
-    """Usa IP-Adapter FaceID si está disponible; si falla, devuelve None."""
+    """FaceID con embeddings explícitos: evita errores internos del adapter.generate."""
     base = _load_base()
     adapter = _load_faceid_adapter(base)
     if adapter is None:
         return None
 
+    # 1) Cargar imagen de referencia y normalizar a RGB
     try:
         src = _fetch_image(params.image_url, (params.width, params.height))
     except Exception as e:
         log.warning(f"No pude descargar image_url: {e}")
         return None
 
-    p, n = _compose_prompts(params.prompt, params.negative_prompt)
+    if src.mode not in ("RGB", "RGBA"):
+        src = src.convert("RGB")
+    elif src.mode == "RGBA":
+        # Para FaceID, mejor pasar RGB (sin alpha) para embeddings
+        src = src.convert("RGB")
+
+    ptxt, ntxt = _compose_prompts(params.prompt, params.negative_prompt)
     g = None
     if params.seed is not None:
         g = torch.Generator(device=DEVICE).manual_seed(int(params.seed))
 
-    # Mapeo: más identidad -> más “peso” del adapter; strength controla variación
-    faceid_scale = max(0.1, min(1.2, params.identity_strength * 1.2))
-    img2img_strength = max(0.05, min(0.6, params.strength))
+    # 2) Calcular embeddings FaceID de forma explícita
+    try:
+        if hasattr(adapter, "get_faceid_embeds"):
+            embeds = adapter.get_faceid_embeds(src)
+        else:
+            # Método alternativo usado en algunas variantes del adapter
+            embeds = adapter.compute_embeds(src)
+    except Exception as e:
+        log.warning(f"No se pudo calcular faceid_embeds: {e}")
+        return None
 
-    log.info(f"➡️ FaceID | identity={params.identity_strength:.2f} (scale={faceid_scale:.2f}) strength={img2img_strength:.2f}")
+    if embeds is None:
+        log.warning("faceid_embeds=None (¿no se detectó rostro válido en la referencia?).")
+        return None
+
+    # 3) Escala/identidad
+    identity = float(params.identity_strength or 0.9)
+    faceid_scale = max(0.1, min(1.5, 0.6 + identity * 0.6))  # 0.6–1.5 aprox
+    img_w, img_h = params.width, params.height
+    log.info(f"➡️ FaceID | identity={identity:.2f} (scale={faceid_scale:.2f}) strength={params.strength:.2f}")
+
+    # 4) Generar con la pipeline base, inyectando los embeddings explícitos
     with torch.inference_mode():
-        out = adapter.generate(
-            prompt=p,
-            negative_prompt=n,
-            image_pil=src,               # el adapter extrae los embeddings FaceID internamente
-            scale=faceid_scale,
+        out = base(
+            prompt=ptxt,
+            negative_prompt=ntxt,
+            image=src,
+            ip_adapter_image_embeds=embeds,
+            width=img_w,
+            height=img_h,
             num_inference_steps=params.steps,
             guidance_scale=params.guidance,
             generator=g,
-            width=params.width,
-            height=params.height,
         )
     img = out.images[0]
 
-    # refinado ligero
-    img = _apply_refiner_if_needed(img, p, n, params.steps, params.guidance)
-
-    # opcional transparencia
+    # 5) Refiner y transparencia (en el output)
+    img = _apply_refiner_if_needed(img, ptxt, ntxt, params.steps, params.guidance)
     img = _maybe_transparent(img, params.transparent)
     return img
+
 
 
 def _img2img_plain(params: GenParams) -> Optional[Image.Image]:
