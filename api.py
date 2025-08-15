@@ -1,374 +1,399 @@
-import io
-import os
-import base64
-import logging
+import io, os, base64, logging, requests
 from typing import Optional, Tuple
 
 from flask import Flask, request, jsonify, Response, make_response
 
 import torch
 from PIL import Image
-import requests
 
 from diffusers import (
     StableDiffusionXLPipeline,
     StableDiffusionXLImg2ImgPipeline,
 )
 
-# rembg (opcional) para transparencia
+# ---------- IP-Adapter FaceID (si está vendor en tu repo) ----------
+_HAS_FACEID = False
+try:
+    from IP_Adapter.ip_adapter.ip_adapter_faceid import IPAdapterFaceID  # alt nombre
+    _HAS_FACEID = True
+except Exception:
+    try:
+        from IP-Adapter.ip_adapter.ip_adapter_faceid import IPAdapterFaceID
+        _HAS_FACEID = True
+    except Exception:
+        try:
+            from ip_adapter.ip_adapter_faceid import IPAdapterFaceID
+            _HAS_FACEID = True
+        except Exception:
+            _HAS_FACEID = False
+
+# ---------- rembg (opcional p/ transparencia) ----------
 try:
     from rembg import remove as rembg_remove, new_session as rembg_new_session
     _HAS_REMBG = True
 except Exception:
     _HAS_REMBG = False
 
-# -----------------------------------------------------------------------------
-# Logging
-# -----------------------------------------------------------------------------
+# ---------- logging ----------
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("api")
 
-# -----------------------------------------------------------------------------
-# Globals / Config
-# -----------------------------------------------------------------------------
+# ---------- config ----------
 MODEL_ID = os.getenv("SDXL_MODEL_ID", "stabilityai/stable-diffusion-xl-base-1.0")
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-DTYPE = torch.float16 if (DEVICE == "cuda") else torch.float32
+DTYPE = torch.float16 if DEVICE == "cuda" else torch.float32
 
-# Pipelines cargadas bajo demanda
+# intenta detectar el .bin del FaceID
+def _find_faceid_bin() -> Optional[str]:
+    env = os.getenv("IPADAPTER_FACEID_BIN")
+    if env and os.path.isfile(env):
+        return env
+    candidates = [
+        "/workspace/models/ipadapter/ip-adapter-faceid_sdxl.bin",
+        "/srv/app/models/ipadapter/ip-adapter-faceid_sdxl.bin",
+        "/workspace/ip-adapter-faceid_sdxl.bin",
+        "/srv/app/ip-adapter-faceid_sdxl.bin",
+    ]
+    for p in candidates:
+        if os.path.isfile(p):
+            return p
+    return None
+
+FACEID_BIN = _find_faceid_bin()
+if _HAS_FACEID and FACEID_BIN:
+    log.info("✔ IP-Adapter FaceID disponible: %s", FACEID_BIN)
+elif _HAS_FACEID:
+    log.warning("⚠️ IP-Adapter FaceID detectado, pero .bin NO encontrado")
+else:
+    log.warning("⚠️ IP-Adapter FaceID no importable; usaré fallback img2img si se requiere identidad")
+
+# ---------- globals ----------
 _TXT2IMG: Optional[StableDiffusionXLPipeline] = None
 _IMG2IMG: Optional[StableDiffusionXLImg2ImgPipeline] = None
-_REMBG_SESSION = None  # on-demand
+_REMBG_SESSION = None
+_FACEID: Optional[IPAdapterFaceID] = None
 
-# -----------------------------------------------------------------------------
-# Utilidades comunes
-# -----------------------------------------------------------------------------
-def _enable_device(pipe):
-    if DEVICE == "cuda":
-        try:
-            pipe.enable_model_cpu_offload()
-            log.info("✔ enable_model_cpu_offload() activado")
-        except Exception:
-            pipe = pipe.to(DEVICE)
-            log.info("✔ .to(cuda) activado (sin offload)")
-    else:
-        pipe = pipe.to(DEVICE)
-        log.info("✔ .to(cpu) activado")
-    pipe.set_progress_bar_config(disable=False)
-    return pipe
-
-def get_txt2img() -> StableDiffusionXLPipeline:
-    global _TXT2IMG
-    if _TXT2IMG is not None:
-        return _TXT2IMG
-    log.info("⏳ Cargando SDXL TXT2IMG: %s (device=%s, dtype=%s)", MODEL_ID, DEVICE, DTYPE)
-    pipe = StableDiffusionXLPipeline.from_pretrained(
-        MODEL_ID, torch_dtype=DTYPE, use_safetensors=True
-    )
-    _TXT2IMG = _enable_device(pipe)
-    log.info("✔ SDXL TXT2IMG listo")
-    return _TXT2IMG
-
-def get_img2img() -> StableDiffusionXLImg2ImgPipeline:
-    global _IMG2IMG
-    if _IMG2IMG is not None:
-        return _IMG2IMG
-    log.info("⏳ Cargando SDXL IMG2IMG: %s (device=%s, dtype=%s)", MODEL_ID, DEVICE, DTYPE)
-    pipe = StableDiffusionXLImg2ImgPipeline.from_pretrained(
-        MODEL_ID, torch_dtype=DTYPE, use_safetensors=True
-    )
-    _IMG2IMG = _enable_device(pipe)
-    log.info("✔ SDXL IMG2IMG listo")
-    return _IMG2IMG
-
-def _get_rembg_session():
+# ---------- helpers ----------
+def _ensure_rembg():
     global _REMBG_SESSION
     if not _HAS_REMBG:
         return None
     if _REMBG_SESSION is None:
         try:
-            _REMBG_SESSION = rembg_new_session()  # u2net por defecto
-            log.info("✔ rembg session creada")
+            _REMBG_SESSION = rembg_new_session()
+            log.info("✔ rembg listo")
         except Exception as e:
-            log.warning("⚠️ rembg no disponible: %s", e)
+            log.warning("rembg no disponible: %s", e)
             _REMBG_SESSION = None
     return _REMBG_SESSION
 
-# ---------------------- CLIP-safe prompt helpers ------------------------------
-def _split_tags(text: str) -> list[str]:
-    if not text:
-        return []
-    txt = text.replace("\n", ",").replace(";", ",")
-    tags = [t.strip() for t in txt.split(",")]
-    return [t for t in tags if t]
+def _to_png_bytes(pil_img: Image.Image) -> bytes:
+    b = io.BytesIO()
+    pil_img.save(b, format="PNG")
+    return b.getvalue()
 
-def _dedup_preserve_order(items: list[str]) -> list[str]:
-    seen, out = set(), []
-    for t in items:
-        k = t.lower()
+def _maybe_remove_bg(pil_img: Image.Image, want_transparent: bool) -> Tuple[bytes, bool]:
+    if not want_transparent:
+        return _to_png_bytes(pil_img), False
+    sess = _ensure_rembg()
+    if not sess:
+        return _to_png_bytes(pil_img), False
+    try:
+        raw = _to_png_bytes(pil_img)
+        out = rembg_remove(raw, session=sess)
+        return out, True
+    except Exception as e:
+        log.warning("rembg falló: %s", e)
+        return _to_png_bytes(pil_img), False
+
+def _wants_png() -> bool:
+    if request.args.get("format", "").lower() == "png":
+        return True
+    return "image/png" in (request.headers.get("accept","").lower())
+
+def _split_tags(s: str) -> list[str]:
+    if not s: return []
+    s = s.replace("\n", ",").replace(";", ",")
+    return [t.strip() for t in s.split(",") if t.strip()]
+
+def _dedup(seq: list[str]) -> list[str]:
+    seen=set(); out=[]
+    for t in seq:
+        k=t.lower()
         if k not in seen:
-            seen.add(k)
-            out.append(t)
+            seen.add(k); out.append(t)
     return out
 
-def _token_len(tokenizer, text: str) -> int:
-    return len(tokenizer(
-        text, add_special_tokens=False, truncation=False, return_tensors=None
-    )["input_ids"])
+def _clip_count(tok, text: str) -> int:
+    return len(tok(text, add_special_tokens=False, truncation=False)["input_ids"])
 
-def _join_until(tokens_limit: int, parts: list[str], tokenizer) -> str:
-    acc = []
+def _join_until(limit: int, parts: list[str], tok) -> str:
+    acc=[]
     for t in parts:
-        candidate = (", ".join(acc + [t])) if acc else t
-        if _token_len(tokenizer, candidate) <= tokens_limit:
+        cand = (", ".join(acc+[t])) if acc else t
+        if _clip_count(tok, cand) <= limit:
             acc.append(t)
         else:
             break
     return ", ".join(acc)
 
-def clip_hard_trim(pipe, prompt: str, max_tokens: int = 75) -> str:
-    tags = _dedup_preserve_order(_split_tags(prompt))
-    tok_a = getattr(pipe, "tokenizer", None)
-    tok_b = getattr(pipe, "tokenizer_2", None)
-
-    if tok_a is None:
-        # fallback heurístico
-        words, count = [], 0
+def clip_safe(pipe, prompt: str, max_tokens=75) -> str:
+    tags = _dedup(_split_tags(prompt))
+    t1 = getattr(pipe, "tokenizer", None)
+    t2 = getattr(pipe, "tokenizer_2", None)
+    if not t1:
+        # heurístico
+        words=[]; n=0
         for t in tags:
-            w = max(1, len(t.split()))
-            if count + w > max_tokens - 2:
-                break
-            words.append(t); count += w
+            w=max(1,len(t.split()))
+            if n+w>max_tokens-2: break
+            words.append(t); n+=w
         return ", ".join(words)
+    s = _join_until(max_tokens, tags, t1)
+    if t2:
+        s = _join_until(max_tokens, _split_tags(s), t2)
+    return s
 
-    trimmed_a = _join_until(max_tokens, tags, tok_a)
-    if tok_b is not None:
-        safe_tags = _dedup_preserve_order(_split_tags(trimmed_a))
-        trimmed_b = _join_until(max_tokens, safe_tags, tok_b)
-        return trimmed_b
-    return trimmed_a
-
-def build_prompts_clip_safe(pipe, user_prompt: str, user_negative: Optional[str]) -> Tuple[str, str]:
-    base_quality = [
-        "ultra realistic", "photorealistic", "professional headshot",
-        "studio lighting", "soft diffused light", "sharp focus on eyes",
-        "natural skin texture", "centered composition", "front-facing",
-        "neutral expression"
+def build_prompts(pipe, ptxt: str, ng: Optional[str]):
+    base = [
+        "ultra realistic", "photorealistic", "studio headshot",
+        "front-facing", "neutral expression", "sharp focus on eyes",
+        "natural skin texture", "soft diffused lighting"
     ]
-    user_tags = _split_tags(user_prompt)
-    merged = _dedup_preserve_order(user_tags + base_quality)
-
-    draft = ", ".join(merged)
-    final_prompt = clip_hard_trim(pipe, draft, max_tokens=75)
+    pos = _dedup(_split_tags(ptxt) + base)
+    pos = clip_safe(pipe, ", ".join(pos), 75)
 
     base_neg = [
         "blurry", "low quality", "cartoon", "3d render", "uncanny", "distorted face",
-        "text", "watermark", "logo", "artifacts", "harsh shadows", "uneven lighting"
+        "text", "watermark", "logo", "harsh shadows", "over-smoothed skin"
     ]
-    neg_merged = _dedup_preserve_order(_split_tags(user_negative or "") + base_neg)
-    final_negative = clip_hard_trim(pipe, ", ".join(neg_merged), max_tokens=60)
+    neg = _dedup(_split_tags(ng or "") + base_neg)
+    neg = clip_safe(pipe, ", ".join(neg), 60)
+    return pos, neg
 
-    log.info("🧠 prompt(tokens<=75): %s", final_prompt)
-    log.info("🧹 negative(tokens<=60): %s", final_negative)
-    return final_prompt, final_negative
+def _download_image(url_or_b64: str) -> Image.Image:
+    if url_or_b64.startswith("http"):
+        r = requests.get(url_or_b64, timeout=20)
+        r.raise_for_status()
+        return Image.open(io.BytesIO(r.content)).convert("RGB")
+    else:
+        raw = base64.b64decode(url_or_b64)
+        return Image.open(io.BytesIO(raw)).convert("RGB")
 
-# --------------------------- imagen helpers -----------------------------------
-def _to_png_bytes(pil_image) -> bytes:
-    buf = io.BytesIO()
-    pil_image.save(buf, format="PNG")
-    return buf.getvalue()
+# ---------- pipelines ----------
+def get_txt2img() -> StableDiffusionXLPipeline:
+    global _TXT2IMG
+    if _TXT2IMG: return _TXT2IMG
+    log.info("⏳ Cargando SDXL txt2img: %s", MODEL_ID)
+    pipe = StableDiffusionXLPipeline.from_pretrained(MODEL_ID, torch_dtype=DTYPE, use_safetensors=True)
+    if DEVICE=="cuda":
+        try:
+            pipe.enable_model_cpu_offload()
+        except Exception:
+            pipe = pipe.to(DEVICE)
+    else:
+        pipe = pipe.to(DEVICE)
+    pipe.set_progress_bar_config(disable=False)
+    _TXT2IMG = pipe
+    return _TXT2IMG
 
-def _maybe_remove_bg(pil_image, do_transparent: bool) -> Tuple[bytes, bool]:
-    """Devuelve (png_bytes, transparent_applied)"""
-    if not do_transparent:
-        return _to_png_bytes(pil_image), False
+def get_img2img() -> StableDiffusionXLImg2ImgPipeline:
+    global _IMG2IMG
+    if _IMG2IMG: return _IMG2IMG
+    log.info("⏳ Cargando SDXL img2img: %s", MODEL_ID)
+    pipe = StableDiffusionXLImg2ImgPipeline.from_pretrained(MODEL_ID, torch_dtype=DTYPE, use_safetensors=True)
+    if DEVICE=="cuda":
+        try:
+            pipe.enable_model_cpu_offload()
+        except Exception:
+            pipe = pipe.to(DEVICE)
+    else:
+        pipe = pipe.to(DEVICE)
+    pipe.set_progress_bar_config(disable=False)
+    _IMG2IMG = pipe
+    return _IMG2IMG
 
-    sess = _get_rembg_session()
-    if not sess:
-        log.warning("⚠️ rembg no disponible; devolviendo imagen con fondo")
-        return _to_png_bytes(pil_image), False
-
+def get_faceid() -> Optional[IPAdapterFaceID]:
+    global _FACEID
+    if _FACEID is not None:
+        return _FACEID
+    if not (_HAS_FACEID and FACEID_BIN):
+        return None
+    # FaceID se monta sobre la pipeline txt2img
+    p = get_txt2img()
     try:
-        raw = _to_png_bytes(pil_image)
-        out = rembg_remove(raw, session=sess)
-        return out, True
+        _FACEID = IPAdapterFaceID(p, FACEID_BIN, device=DEVICE)
+        log.info("✔ IP-Adapter FaceID inicializado")
+        return _FACEID
     except Exception as e:
-        log.warning("⚠️ rembg falló: %s; devolviendo imagen con fondo", e)
-        return _to_png_bytes(pil_image), False
+        log.warning("No pude inicializar FaceID: %s", e)
+        return None
 
-def _wants_png() -> bool:
-    # Si el cliente pide imagen: Accept: image/png o ?format=png
-    if request.args.get("format", "").lower() == "png":
-        return True
-    acc = request.headers.get("accept", "")
-    return "image/png" in acc.lower()
-
-def _load_pil_from_input(image_url: Optional[str], image_base64: Optional[str]) -> Image.Image:
-    if image_base64:
-        try:
-            raw = base64.b64decode(image_base64)
-            return Image.open(io.BytesIO(raw)).convert("RGB")
-        except Exception as e:
-            raise ValueError(f"image_base64 inválido: {e}")
-    if image_url:
-        try:
-            r = requests.get(image_url, timeout=20)
-            r.raise_for_status()
-            return Image.open(io.BytesIO(r.content)).convert("RGB")
-        except Exception as e:
-            raise ValueError(f"image_url inválido: {e}")
-    raise ValueError("Debes enviar image_url o image_base64")
-
-# -----------------------------------------------------------------------------
-# Flask App
-# -----------------------------------------------------------------------------
+# ---------- Flask ----------
 app = Flask(__name__)
 
 @app.get("/health")
 def health():
-    try:
-        _ = get_txt2img()
-        return jsonify(ok=True, device=DEVICE, has_rembg=_HAS_REMBG)
-    except Exception as e:
-        return jsonify(ok=False, error=str(e)), 500
+    return jsonify(
+        ok=True,
+        device=DEVICE,
+        has_rembg=_HAS_REMBG,
+        has_faceid=bool(_HAS_FACEID),
+        faceid_bin=bool(FACEID_BIN)
+    )
 
-# ------------------------------- /generate ------------------------------------
 @app.post("/generate")
 def generate():
     data = request.get_json(force=True, silent=True) or {}
-    prompt_in = data.get("prompt", "") or ""
-    negative_in = data.get("negative_prompt", "") or ""
-    width = int(data.get("width", 1024))
-    height = int(data.get("height", 1024))
-    steps = int(data.get("steps", 30))
-    guidance = float(data.get("guidance", 7.0))
-    transparent = data.get("transparent", False) in (True, "true", 1, "1")
+    prompt_in = data.get("prompt","") or ""
+    negative_in = data.get("negative_prompt","") or ""
+    w = int(data.get("width",1024)); h = int(data.get("height",1024))
+    steps = int(data.get("steps",30)); guidance = float(data.get("guidance",7.0))
+    transparent = data.get("transparent", False) in (True,"true",1,"1")
     seed = data.get("seed", None)
 
-    log.info("➡️ TXT2IMG | steps=%s guide=%s size=%sx%s transparent=%s seed=%s",
-             steps, guidance, width, height, transparent, seed)
-
+    log.info("➡️ /generate w=%s h=%s steps=%s gs=%.2f transp=%s", w,h,steps,guidance,transparent)
     p = get_txt2img()
+    pos, neg = build_prompts(p, prompt_in, negative_in)
 
-    # Prompts “CLIP-safe”
-    final_prompt, final_negative = build_prompts_clip_safe(p, prompt_in, negative_in)
-
-    # Fondo neutro si no pediste transparencia
-    if not transparent:
-        if "plain light gray background" not in final_prompt.lower():
-            final_prompt = clip_hard_trim(p, final_prompt + ", plain light gray background", 75)
-
-    generator = None
+    gen = None
     if seed is not None:
-        try:
-            generator = torch.Generator(device=DEVICE).manual_seed(int(seed))
-        except Exception:
-            pass
-
-    # Inference
-    images = p(
-        prompt=final_prompt,
-        negative_prompt=final_negative,
-        num_inference_steps=steps,
-        guidance_scale=guidance,
-        width=width,
-        height=height,
-        generator=generator
-    ).images
-
-    img = images[0]
-    png_bytes, did_transp = _maybe_remove_bg(img, transparent)
-
-    if _wants_png():
-        resp = make_response(png_bytes)
-        resp.headers["Content-Type"] = "image/png"
-        resp.headers["X-Transparent"] = "1" if did_transp else "0"
-        return resp
-
-    b64 = base64.b64encode(png_bytes).decode("ascii")
-    return jsonify(
-        ok=True,
-        transparent_applied=bool(did_transp),
-        prompt=final_prompt,
-        negative_prompt=final_negative,
-        image_base64=b64
-    )
-
-# --------------------------- /generate_from (NEW) -----------------------------
-@app.post("/generate_from")
-def generate_from():
-    """
-    Cambia la pose/encuadre a partir de un headshot (img2img con SDXL).
-    JSON:
-      - image_url o image_base64 (obligatorio uno)
-      - prompt (tu prompt + instrucciones de pose)
-      - negative_prompt (opcional)
-      - width, height (por defecto 1024x1024)
-      - steps (30), guidance (6.5–7.5), strength (0.35–0.6)
-      - transparent (bool)
-      - seed (opcional)
-    """
-    data = request.get_json(force=True, silent=True) or {}
-    image_url = data.get("image_url")
-    image_base64 = data.get("image_base64")
-    prompt_in = data.get("prompt", "") or ""
-    negative_in = data.get("negative_prompt", "") or ""
-    width = int(data.get("width", 1024))
-    height = int(data.get("height", 1024))
-    steps = int(data.get("steps", 30))
-    guidance = float(data.get("guidance", 7.0))
-    strength = float(data.get("strength", 0.45))  # 0.35 cambios sutiles, 0.6 más fuertes
-    transparent = data.get("transparent", False) in (True, "true", 1, "1")
-    seed = data.get("seed", None)
-
-    init_img = _load_pil_from_input(image_url, image_base64)
-    init_img = init_img.convert("RGB").resize((width, height), Image.LANCZOS)
-
-    log.info("➡️ IMG2IMG | steps=%s guide=%s strength=%.2f size=%sx%s transparent=%s seed=%s",
-             steps, guidance, strength, width, height, transparent, seed)
-
-    p = get_img2img()
-
-    # Prompts “CLIP-safe” y algunos nudges para headshot pasaporte
-    pose_nudges = ", centered headshot, shoulders visible, straight on, eyes level, neutral expression"
-    final_prompt, final_negative = build_prompts_clip_safe(p, prompt_in + pose_nudges, negative_in)
-
-    generator = None
-    if seed is not None:
-        try:
-            generator = torch.Generator(device=DEVICE).manual_seed(int(seed))
-        except Exception:
-            pass
+        gen = torch.Generator(device=DEVICE).manual_seed(int(seed))
 
     out = p(
-        prompt=final_prompt,
-        negative_prompt=final_negative,
-        image=init_img,
-        strength=strength,
+        prompt=pos,
+        negative_prompt=neg,
+        width=w,
+        height=h,
         num_inference_steps=steps,
         guidance_scale=guidance,
-        generator=generator,
+        generator=gen
     ).images[0]
 
-    png_bytes, did_transp = _maybe_remove_bg(out, transparent)
-
+    png, did = _maybe_remove_bg(out, transparent)
     if _wants_png():
-        resp = make_response(png_bytes)
-        resp.headers["Content-Type"] = "image/png"
-        resp.headers["X-Transparent"] = "1" if did_transp else "0"
-        return resp
+        r = make_response(png); r.headers["Content-Type"]="image/png"; r.headers["X-Transparent"]="1" if did else "0"
+        return r
+    return jsonify(ok=True, prompt=pos, negative_prompt=neg, transparent_applied=bool(did),
+                   image_base64=base64.b64encode(png).decode("ascii"))
 
-    b64 = base64.b64encode(png_bytes).decode("ascii")
-    return jsonify(
-        ok=True,
-        transparent_applied=bool(did_transp),
-        prompt=final_prompt,
-        negative_prompt=final_negative,
-        image_base64=b64
-    )
+@app.post("/face")
+def face():
+    """
+    Genera manteniendo identidad del headshot:
+    - FaceID (si el .bin está disponible) → mejor matching y permite cambiar pose por prompt.
+    - Fallback: img2img con denoise bajo usando el headshot como init.
+    Body JSON:
+    {
+      "image_url": "http://... o base64",
+      "prompt": "... (e.g., thinking, analyzing, business casual, 3/4 torso, looking slightly left)",
+      "negative_prompt": "...",
+      "width": 1024, "height": 1024,
+      "steps": 30, "guidance": 7.0,
+      "transparent": true,
+      "seed": 42,
+      "adapter_strength": 0.9,   # (FaceID) ~0.7-1.2
+      "use_init": false,         # si además quieres img2img
+      "strength": 0.25           # denoise de img2img si use_init=true
+    }
+    """
+    data = request.get_json(force=True, silent=True) or {}
+    src = data.get("image_url") or data.get("image_base64")
+    if not src:
+        return jsonify(ok=False, error="image_url o image_base64 requerido"), 400
 
-# -----------------------------------------------------------------------------
-# Main (local debug)
-# -----------------------------------------------------------------------------
+    prompt_in = data.get("prompt","") or ""
+    negative_in = data.get("negative_prompt","") or ""
+    w = int(data.get("width",1024)); h = int(data.get("height",1024))
+    steps = int(data.get("steps",30)); guidance = float(data.get("guidance",7.0))
+    transparent = data.get("transparent", False) in (True,"true",1,"1")
+    seed = data.get("seed", None)
+
+    adapter_strength = float(data.get("adapter_strength", 0.9))
+    use_init = data.get("use_init", False) in (True,"true",1,"1")
+    strength = float(data.get("strength", 0.25))
+
+    ref = _download_image(src)
+    log.info("➡️ /face steps=%s gs=%.2f faceid=%s init=%s",
+             steps, guidance, bool(_HAS_FACEID and FACEID_BIN), use_init)
+
+    # Preferir FaceID si está disponible
+    faceid = get_faceid()
+    if faceid is not None:
+        pipe = get_txt2img()
+        pos, neg = build_prompts(pipe, prompt_in, negative_in)
+
+        # Embeddings de la cara
+        try:
+            image_embeds, uncond = faceid.get_image_embeds(ref)
+        except Exception as e:
+            log.warning("get_image_embeds falló (%s); haré fallback img2img", e)
+            faceid = None
+        else:
+            gen=None
+            if seed is not None:
+                gen = torch.Generator(device=DEVICE).manual_seed(int(seed))
+
+            # Opción: también usar init image (ayuda a pelo/tono); si no, puro text2img con FaceID
+            if use_init:
+                img2img = get_img2img()
+                pos2, neg2 = build_prompts(img2img, pos, neg)  # igual, recorte seguro
+                out = img2img(
+                    prompt=pos2,
+                    negative_prompt=neg2,
+                    image=ref.resize((w,h), Image.LANCZOS),
+                    strength=strength,
+                    num_inference_steps=steps,
+                    guidance_scale=guidance,
+                    image_embeds=image_embeds,
+                    negative_image_embeds=uncond,
+                    ip_adapter_scale=adapter_strength,
+                    generator=gen
+                ).images[0]
+            else:
+                out = pipe(
+                    prompt=pos,
+                    negative_prompt=neg,
+                    width=w, height=h,
+                    num_inference_steps=steps,
+                    guidance_scale=guidance,
+                    image_embeds=image_embeds,
+                    negative_image_embeds=uncond,
+                    ip_adapter_scale=adapter_strength,
+                    generator=gen
+                ).images[0]
+
+            png, did = _maybe_remove_bg(out, transparent)
+            if _wants_png():
+                r = make_response(png); r.headers["Content-Type"]="image/png"; r.headers["X-Transparent"]="1" if did else "0"
+                return r
+            return jsonify(ok=True, used_faceid=True, transparent_applied=bool(did),
+                           image_base64=base64.b64encode(png).decode("ascii"))
+
+    # -------- Fallback: img2img sin FaceID (preserva bastante; menos fiel) --------
+    img2img = get_img2img()
+    pos, neg = build_prompts(img2img, prompt_in, negative_in)
+    gen=None
+    if seed is not None:
+        gen = torch.Generator(device=DEVICE).manual_seed(int(seed))
+
+    ref_resized = ref.resize((w,h), Image.LANCZOS)
+    out = img2img(
+        prompt=pos, negative_prompt=neg,
+        image=ref_resized,
+        strength=strength,                # <= 0.25 para fidelidad facial
+        num_inference_steps=steps,
+        guidance_scale=guidance,
+        generator=gen
+    ).images[0]
+
+    png, did = _maybe_remove_bg(out, transparent)
+    if _wants_png():
+        r = make_response(png); r.headers["Content-Type"]="image/png"; r.headers["X-Transparent"]="1" if did else "0"
+        return r
+    return jsonify(ok=True, used_faceid=False, transparent_applied=bool(did),
+                   image_base64=base64.b64encode(png).decode("ascii"))
+
+
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "3000")), debug=False)
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT","3000")), debug=False)
