@@ -2,77 +2,74 @@
 set -euo pipefail
 
 APP_DIR="${APP_DIR:-/srv/app}"
-ALT_DIR="/workspace"                     # fallback si usas /workspace
 VENV="${VENV:-/opt/venv}"
 HOST="0.0.0.0"
 PORT="${PORT:-3000}"
 
-echo "== Boot =="
-python3 --version || true
-
-# 1) venv + pip
+# ---------- venv ----------
 if [[ ! -x "$VENV/bin/python" ]]; then
   python3 -m venv "$VENV"
 fi
 source "$VENV/bin/activate"
 python -m pip install --upgrade pip wheel setuptools
 
-# 2) limpiar posibles restos conflictivos
+# ---------- constraints globales ----------
+# Fuerza numpy<2 en TODO lo que se instale después
+CONSTR="/tmp/constraints.txt"
+echo "numpy<2" > "$CONSTR"
+
+# Limpia restos posibles
 pip uninstall -y numpy onnxruntime onnxruntime-gpu || true
 
-# 3) pin estable de NumPy 1.x (compatible con tu stack actual)
-pip install --no-cache-dir "numpy==1.26.4"
+# Pin inicial de numpy 1.x
+pip install --no-cache-dir --constraint "$CONSTR" "numpy==1.26.4"
 
-# 4) PyTorch CUDA 11.8 (tu versión probada)
+# ---------- PyTorch CUDA 11.8 ----------
 pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cu118 \
   torch==2.0.1+cu118 torchvision==0.15.2+cu118 torchaudio==2.0.2+cu118
 
-# 5) resto de deps de la app
-pip install --no-cache-dir \
+# ---------- Resto dependencias base ----------
+pip install --no-cache-dir --constraint "$CONSTR" \
   diffusers==0.24.0 transformers==4.35.2 huggingface_hub==0.19.4 \
   accelerate==0.24.1 safetensors==0.3.1 flask gunicorn \
   einops==0.7.0 timm==0.9.16 opencv-python-headless pillow
 
-# 6) onnxruntime GPU compatible con numpy 1.26 + rembg GPU
-pip install --no-cache-dir "onnxruntime-gpu==1.15.1" "rembg[gpu]==2.0.50"
+# ---------- ORT GPU + rembg GPU (compatibles con numpy 1.26.x) ----------
+pip install --no-cache-dir --constraint "$CONSTR" \
+  "onnxruntime-gpu==1.15.1" "rembg[gpu]==2.0.50"
 
-# 7) Caches de HF (opcional)
-export HF_HOME="${HF_HOME:-/workspace/.cache/huggingface}"
-export HUGGINGFACE_HUB_CACHE="${HUGGINGFACE_HUB_CACHE:-/workspace/.cache/huggingface}"
-mkdir -p "$HF_HOME"
+# ---------- requirements del repo (si existen) ----------
+if [[ -f "$APP_DIR/requirements.txt" ]]; then
+  # APLICAMOS TAMBIÉN LA CONSTRAINT AQUÍ, para impedir que suba numpy
+  pip install --no-cache-dir --constraint "$CONSTR" -r "$APP_DIR/requirements.txt"
+fi
 
-# 8) Preflight imports claros
-echo ">> preflight import"
+# ---------- preflight ----------
 python - <<'PY'
-import importlib.util, pathlib, sys
-for mod in ("torch","diffusers","rembg"):
+import importlib
+for mod in ("numpy","torch","diffusers","onnxruntime","rembg"):
     try:
-        __import__(mod)
-        print(f"[ok] {mod}")
+        m = importlib.import_module(mod)
+        print(f"[ok] {mod} {getattr(m, '__version__', '?')}")
     except Exception as e:
         print(f"[ERR] {mod}: {e}")
-p = next((pathlib.Path(n) for n in ("api.py","app.py","main.py") if pathlib.Path(n).exists()), None)
-if not p: raise SystemExit("no app file found")
-spec = importlib.util.spec_from_file_location(p.stem, p)
-m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
-print(f"[ok] loaded {p.name}")
-print("[ok] ready")
 PY
 
-# 9) Detectar módulo/objeto Flask
-MOD="$(ls | grep -E '^(api|app|main)\.py$' | head -n1 | sed 's/\.py$//')"
-OBJ="$(python - <<PY
+# ---------- launch ----------
+cd "$APP_DIR"
+MOD=$(ls | grep -E '^(api|app|main)\.py$' | head -n1 | sed 's/\.py$//')
+OBJ=$(python - <<PY
 import importlib.util, pathlib
 p = pathlib.Path("$MOD.py")
 s = importlib.util.spec_from_file_location("$MOD", p)
 m = importlib.util.module_from_spec(s); s.loader.exec_module(m)
 print("app" if hasattr(m,"app") else ("application" if hasattr(m,"application") else ""))
 PY
-)"
-if [[ -z "$MOD" || -z "$OBJ" ]]; then
+)
+if [[ -z "$OBJ" ]]; then
   echo "❌ No Flask app (esperado app/application)"
   exit 1
 fi
 
-echo "🚀 gunicorn ${MOD}:${OBJ} on ${HOST}:${PORT}"
+echo "🚀 arrancando ${MOD}:${OBJ}"
 exec gunicorn -w 1 -k gthread --threads 8 -b "${HOST}:${PORT}" "${MOD}:${OBJ}"
