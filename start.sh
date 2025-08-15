@@ -40,7 +40,7 @@ else
     einops==0.7.0 timm==0.9.16 insightface==0.7.3 onnxruntime==1.16.3 rembg==2.0.50
 fi
 
-# 5) Asegurar paquete ip_adapter (si tu repo no lo trae, lo vendoriza automáticamente)
+# 5) Asegurar paquete ip_adapter (vendor o descargar)
 PKG_ROOT=""
 if [ -d "$APP_DIR/IP-Adapter/ip_adapter" ]; then
   PKG_ROOT="$APP_DIR/IP-Adapter"
@@ -64,7 +64,7 @@ else
   cd "$APP_DIR"
 fi
 
-# 6) Escribir .pth para que Python encuentre ip_adapter sin tocar PYTHONPATH
+# 6) Registrar ip_adapter en site-packages
 SP=$("$VENV/bin/python" - <<'PY'
 import site
 c=[p for p in site.getsitepackages() if p.endswith("site-packages")]
@@ -93,7 +93,7 @@ export FACEID_CKPT="$FACE_BIN"
 cd "$APP_DIR"
 MOD=$(ls | grep -E "^(api|app|main)\.py$" | head -n1 | sed 's/\.py$//')
 OBJ=$("$VENV/bin/python" - <<PY
-import importlib.util, pathlib, sys
+import importlib.util, pathlib
 p = pathlib.Path("$MOD.py"); s = importlib.util.spec_from_file_location("$MOD", p)
 m = importlib.util.module_from_spec(s); s.loader.exec_module(m)
 print("app" if hasattr(m,"app") else ("application" if hasattr(m,"application") else ""))
