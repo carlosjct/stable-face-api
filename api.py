@@ -1,103 +1,51 @@
-import os
-os.environ["HF_HUB_DOWNLOAD_THREADS"] = "1"
-os.environ["TOKENIZERS_PARALLELISM"] = "false"
-os.environ["TRANSFORMERS_NO_ADVISORY_WARNINGS"] = "1"
-
-from flask import Flask, request, jsonify, send_file
-from diffusers import StableDiffusionXLPipeline
-from ip_adapter.ip_adapter_faceid import IPAdapterFaceID
-import torch
-from PIL import Image
-import requests
-import io
-import uuid
-import insightface
-import cv2
-import numpy as np
+import os, pathlib
+from flask import Flask, jsonify, request
 
 app = Flask(__name__)
 
-# ---------- CONFIG ----------
-device = "cuda" if torch.cuda.is_available() else "cpu"
-ip_model_path = "/workspace/models/ipadapter/ip-adapter-faceid_sdxl.bin"
+@app.get("/health")
+def health():
+    return jsonify({"status": "ok", "faceid_enabled": bool(os.getenv("USE_FACEID", "1") == "1")})
 
-# ---------- LOAD PIPELINE & ADAPTER ----------
-print("⏳ Cargando modelo SDXL...")
-pipe = StableDiffusionXLPipeline.from_pretrained(
-    "stabilityai/stable-diffusion-xl-base-1.0",
-    torch_dtype=torch.float16,
-    variant="fp16",
-    use_safetensors=True,
-).to(device)
+# --- config ---
+USE_FACEID = os.getenv("USE_FACEID", "1") == "1"
+IP_FACEID_PATH = os.getenv("IP_ADAPTER_FACEID_PATH", "/workspace/models/ipadapter/ip-adapter-faceid_sdxl.bin")
+DEVICE = "cuda"  # o "cpu" si quieres forzar
 
-pipe.enable_model_cpu_offload()
+# --- lazy load ---
+pipe = None
+ip_adapter = None
 
-print("⏳ Cargando IP-Adapter-FaceID...")
-ip_adapter = IPAdapterFaceID(pipe, ip_model_path, device=device)
+def load_pipe():
+    global pipe
+    if pipe is not None:
+        return pipe
+    print("⏳ Cargando SDXL...", flush=True)
+    # TODO: importa y crea el pipeline aquí, con enable_model_cpu_offload() si usas GPU pequeña
+    # pipe = StableDiffusionXLPipeline.from_pretrained(...).to(DEVICE)
+    return pipe
 
-print("⏳ Cargando InsightFace...")
-face_app = insightface.app.FaceAnalysis(name="buffalo_l", providers=["CUDAExecutionProvider"])
-face_app.prepare(ctx_id=0, det_size=(640, 640))
-
-# ---------- UTILS ----------
-def download_image(url):
-    try:
-        response = requests.get(url)
-        img = Image.open(io.BytesIO(response.content))
-        if img.mode == "P":
-            img = img.convert("RGBA")
-        return img.convert("RGB")
-    except Exception as e:
-        print(f"❌ Error al descargar imagen: {e}")
+def load_faceid_adapter():
+    global ip_adapter
+    if ip_adapter is not None:
+        return ip_adapter
+    if not USE_FACEID:
+        print("⚠️ USE_FACEID=0 → no se cargará FaceID", flush=True)
         return None
+    if not os.path.isfile(IP_FACEID_PATH):
+        print(f"⚠️ Peso FaceID no encontrado en {IP_FACEID_PATH}. Arrancando sin FaceID.", flush=True)
+        return None
+    print("⏳ Cargando IP-Adapter FaceID...", flush=True)
+    p = load_pipe()
+    from ip_adapter.ip_adapter_faceid import IPAdapterFaceID
+    ip_adapter = IPAdapterFaceID(p, IP_FACEID_PATH, device=DEVICE)
+    return ip_adapter
 
-def pil_to_cv2(img):
-    return cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
-
-# ---------- API ROUTE ----------
-@app.route("/generate", methods=["POST"])
+@app.post("/generate")
 def generate():
-    try:
-        data = request.json
-        prompt = data.get("prompt", "")
-        negative_prompt = data.get("negative_prompt", "")
-        steps = int(data.get("steps", 30))
-        image_url = data.get("image_url")
-
-        image_embeds = None
-
-        if image_url:
-            print("📷 Usando imagen de referencia...")
-            face_image = download_image(image_url)
-            if face_image is None:
-                return jsonify({"error": "No se pudo descargar la imagen"}), 400
-
-            face_np = pil_to_cv2(face_image)
-            faces = face_app.get(face_np)
-            if not faces:
-                return jsonify({"error": "No se detectó rostro válido en la imagen"}), 400
-
-            # ✅ Usar la imagen directamente como PIL
-            image_embeds = ip_adapter.get_image_embeds(face_image)
-            ip_adapter.set_image_embeds(image_embeds)
-
-        print("🎨 Generando imagen...")
-
-        result = pipe(
-            prompt=prompt,
-            negative_prompt=negative_prompt,
-            num_inference_steps=steps,
-        ).images[0]
-
-        output_path = f"/tmp/output_{uuid.uuid4().hex}.png"
-        result.save(output_path)
-
-        return send_file(output_path, mimetype="image/png")
-
-    except Exception as e:
-        print(f"❌ Error en generación: {e}")
-        return jsonify({"error": str(e)}), 500
-
-# ---------- MAIN ----------
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=3000)
+    p = load_pipe()
+    fa = load_faceid_adapter()  # puede ser None y seguimos
+    data = request.get_json(force=True)
+    prompt = data.get("prompt", "a photo")
+    # TODO: usa p (y fa si no es None) para generar
+    return jsonify({"ok": True, "used_faceid": fa is not None})
