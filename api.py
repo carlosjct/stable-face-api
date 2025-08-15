@@ -7,14 +7,13 @@ from typing import Optional, Tuple
 from dataclasses import dataclass
 
 from flask import Flask, request, jsonify, send_file
-from PIL import Image, ImageOps
+from PIL import Image, ImageOps, ImageFile
 import requests
 
 import torch
 from diffusers import (
     StableDiffusionXLPipeline,
     StableDiffusionXLImg2ImgPipeline,  # refiner / img2img
-    DPMSolverMultistepScheduler,
     EulerAncestralDiscreteScheduler,
     AutoencoderKL,
 )
@@ -63,7 +62,7 @@ app = Flask(__name__)
 
 _base: Optional[StableDiffusionXLPipeline] = None
 _img2img: Optional[StableDiffusionXLImg2ImgPipeline] = None
-_faceid: Optional["IPAdapterFaceID"] = None  # type: ignore
+_faceid: Optional['IPAdapterFaceID'] = None  # type: ignore
 
 _vae = None
 def _load_vae():
@@ -111,7 +110,7 @@ def _load_img2img() -> StableDiffusionXLImg2ImgPipeline:
         log.info("✔ img2img listo")
     return _img2img
 
-def _load_faceid_adapter(base_pipe: StableDiffusionXLPipeline) -> Optional["IPAdapterFaceID"]:
+def _load_faceid_adapter(base_pipe: StableDiffusionXLPipeline) -> Optional['IPAdapterFaceID']:
     global _faceid
     if not HAS_FACEID:
         return None
@@ -127,17 +126,28 @@ def _load_faceid_adapter(base_pipe: StableDiffusionXLPipeline) -> Optional["IPAd
             _faceid = None
     return _faceid
 
+# -------- Imagen robusta --------
+ImageFile.LOAD_TRUNCATED_IMAGES = True
 def _fetch_image(url: str, size: Tuple[int, int]) -> Image.Image:
     r = requests.get(url, timeout=30)
     r.raise_for_status()
-    img = Image.open(io.BytesIO(r.content)).convert("RGB")
+    img = Image.open(io.BytesIO(r.content))
+    # Normalizar modos problemáticos (P/LA/L) y alpha
+    if img.mode in ("P", "LA", "L"):
+        img = img.convert("RGBA")
+    if img.mode == "RGBA":
+        # Quitar alpha para FaceID/SDXL (evita rarezas en embeddings)
+        img = img.convert("RGB")
+    elif img.mode != "RGB":
+        img = img.convert("RGB")
+    # Contener a tamaño destino sobre fondo blanco
     img = ImageOps.contain(img, size, method=Image.LANCZOS)
     bg = Image.new("RGB", size, (255, 255, 255))
     bg.paste(img, ((size[0] - img.width) // 2, (size[1] - img.height) // 2))
     return bg
 
 REALISM_ADD = (
-    "ultra realistic, photorealistic, 8k, professional studio photography, "
+    "ultra realistic, photorealistic, professional studio photography, "
     "natural skin texture, detailed pores, lifelike hair, accurate facial proportions, "
     "soft diffused lighting, sharp focus on eyes, subtle depth of field, "
     "no cgi, no 3d render, no cartoon"
@@ -202,10 +212,10 @@ class GenParams:
     image_url: Optional[str]
     strength: float
     identity_strength: float
-    # NUEVO: ajuste de pose sólo con texto (opcional)
+    # Ajuste de pose sólo con texto (opcional)
     pose_prompt: Optional[str] = None
-    pose_strength: float = 0.15     # fuerza del paso img2img de pose
-    pose_steps: int = 20            # pasos del paso de pose
+    pose_strength: float = 0.15
+    pose_steps: int = 20
 
 def _parse_json() -> GenParams:
     j = request.get_json(force=True, silent=True) or {}
@@ -265,36 +275,71 @@ def _txt2img(params: GenParams) -> Image.Image:
     img = _maybe_transparent(img, params.transparent)
     return img
 
+# ---- FaceID helpers: computar embeds explícitos (evita adapter.generate) ----
+def _compute_faceid_embeds(adapter, image_rgb: Image.Image):
+    # La mayoría de implementaciones exponen get_faceid_embeds(image_rgb)
+    if hasattr(adapter, "get_faceid_embeds"):
+        return adapter.get_faceid_embeds(image_rgb)
+    # Fallback: algunas exponen get_image_embeds
+    if hasattr(adapter, "get_image_embeds"):
+        return adapter.get_image_embeds(image_rgb)
+    raise RuntimeError("El adapter FaceID no expone método de embeddings compatible.")
+
 def _edit_with_faceid(params: GenParams) -> Optional[Image.Image]:
     base = _load_base()
     adapter = _load_faceid_adapter(base)
     if adapter is None:
         return None
     try:
-        src = _fetch_image(params.image_url, (params.width, params.height))
+        r = requests.get(params.image_url, timeout=30)
+        r.raise_for_status()
+        src = Image.open(io.BytesIO(r.content))
+        # Normalizar a RGB para embeddings
+        if src.mode in ("P", "LA", "L"):
+            src = src.convert("RGBA")
+        if src.mode == "RGBA":
+            src_rgb = src.convert("RGB")
+        else:
+            src_rgb = src.convert("RGB") if src.mode != "RGB" else src
+        # Ajustar a tamaño destino (mantiene proporción)
+        src_rgb = ImageOps.contain(src_rgb, (params.width, params.height), method=Image.LANCZOS)
     except Exception as e:
         log.warning(f"No pude descargar image_url: {e}")
         return None
+
     p, n = _compose_prompts(params.prompt, params.negative_prompt)
     g = None
     if params.seed is not None:
         g = torch.Generator(device=DEVICE).manual_seed(int(params.seed))
+
+    # --- Embeddings explícitos ---
+    try:
+        embeds = _compute_faceid_embeds(adapter, src_rgb)
+    except Exception as e:
+        log.warning(f"No se pudo calcular faceid_embeds: {e}")
+        return None
+    if embeds is None:
+        log.warning("faceid_embeds=None (¿no se detectó rostro válido en la referencia?)")
+        return None
+
     faceid_scale = max(0.1, min(1.2, params.identity_strength * 1.2))
-    img2img_strength = max(0.05, min(0.6, params.strength))
-    log.info(f"➡️ FaceID | identity={params.identity_strength:.2f} (scale={faceid_scale:.2f}) strength={img2img_strength:.2f}")
+    log.info(f"➡️ FaceID | identity={params.identity_strength:.2f} (scale={faceid_scale:.2f})")
+
     with torch.inference_mode():
-        out = adapter.generate(
+        out = base(
             prompt=p,
             negative_prompt=n,
-            image_pil=src,
-            scale=faceid_scale,
+            image=src_rgb,
+            ip_adapter_image_embeds=embeds,
+            ip_adapter_scale=faceid_scale,
+            width=params.width,
+            height=params.height,
             num_inference_steps=params.steps,
             guidance_scale=params.guidance,
             generator=g,
-            width=params.width,
-            height=params.height,
         )
     img = out.images[0]
+
     # Ajuste de pose opcional (texto) ANTES del refiner
     img = _apply_pose_tweak_if_requested(img, params)
     # Refiner y transparencia
@@ -326,14 +371,13 @@ def _img2img_plain(params: GenParams) -> Optional[Image.Image]:
     img = _maybe_transparent(img, params.transparent)
     return img
 
-# -------- NUEVO: ajuste de pose sólo texto (pequeño img2img) --------
+# -------- Ajuste de pose sólo texto (micro img2img) --------
 POSE_NEG = "straight gaze, looking at camera, head straight"
 
 def _apply_pose_tweak_if_requested(img: Image.Image, params: GenParams) -> Image.Image:
     if not params.pose_prompt:
         return img
     pipe = _load_img2img()
-    # Combinamos prompt con indicaciones de pose, y reforzamos el negativo típico que compite
     pose_p = f"{params.pose_prompt}"
     pose_n = f"{POSE_NEG}, {params.negative_prompt}" if params.negative_prompt else POSE_NEG
     steps = max(10, int(params.pose_steps))
@@ -346,7 +390,7 @@ def _apply_pose_tweak_if_requested(img: Image.Image, params: GenParams) -> Image
             image=img,
             strength=strength,
             num_inference_steps=steps,
-            guidance_scale=max(5.0, params.guidance),  # un poco más de guide ayuda a obedecer
+            guidance_scale=max(5.0, params.guidance),
         )
     return out.images[0]
 
