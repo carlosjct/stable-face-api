@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# ===== Config por variables de entorno (puedes sobreescribir en el Pod) =====
+# ===== Config por variables de entorno (puedes dejarlas vacías en el Pod) =====
 export SDXL_MODEL="${SDXL_MODEL:-SG161222/RealVisXL_V5.0}"
 export SDXL_REFINER="${SDXL_REFINER:-stabilityai/stable-diffusion-xl-refiner-1.0}"
 export USE_REFINER="${USE_REFINER:-1}"                     # 1 = activar refiner
@@ -26,18 +26,25 @@ update-ca-certificates
 # ===== Python venv + dependencias =====
 if [ ! -x "$VENV/bin/python" ]; then
   python3 -m venv "$VENV"
-  "$VENV/bin/pip" install --upgrade pip
-  # Torch CUDA 11.8
-  "$VENV/bin/pip" install --no-cache-dir --index-url https://download.pytorch.org/whl/cu118 \
-    torch==2.0.1+cu118 torchvision==0.15.2+cu118 torchaudio==2.0.2+cu118
-  # Paquetes base
-  "$VENV/bin/pip" install --no-cache-dir \
-    numpy==1.26.4 pillow==10.4.0 opencv-python-headless==4.10.0.84 \
-    diffusers==0.24.0 transformers==4.35.2 accelerate==0.24.1 safetensors==0.3.1 \
-    einops==0.7.0 timm==0.9.16 \
-    flask==2.3.3 gunicorn==23.0.0 \
-    onnxruntime==1.16.3 rembg==2.0.50
 fi
+"$VENV/bin/pip" install --upgrade pip
+
+# Torch CUDA 11.8
+"$VENV/bin/pip" install --no-cache-dir --index-url https://download.pytorch.org/whl/cu118 \
+  torch==2.0.1+cu118 torchvision==0.15.2+cu118 torchaudio==2.0.2+cu118
+
+# *** FIX DE COMPATIBILIDAD ***
+# diffusers==0.24.0 requiere huggingface_hub<=0.19.x (tiene cached_download)
+"$VENV/bin/pip" install --no-cache-dir --upgrade --force-reinstall \
+  huggingface_hub==0.19.4
+
+# Paquetes base (mantengo versiones probadas)
+"$VENV/bin/pip" install --no-cache-dir \
+  numpy==1.26.4 pillow==10.4.0 opencv-python-headless==4.10.0.84 \
+  diffusers==0.24.0 transformers==4.35.2 accelerate==0.24.1 safetensors==0.3.1 \
+  einops==0.7.0 timm==0.9.16 \
+  flask==2.3.3 gunicorn==23.0.0 \
+  onnxruntime==1.16.3 rembg==2.0.50
 
 # ===== Clonar SIEMPRE la app a /srv/app (recibe tus pushes) =====
 rm -rf "$APP"
@@ -76,8 +83,6 @@ fi
 
 # ===== Mostrar entorno =====
 echo "PATH=$PATH"
-echo "which python: $(which python || true)"
-echo "which gunicorn: $(which gunicorn || true)"
 echo "python: $("$VENV/bin/python" -V)"
 echo "numpy: $("$VENV/bin/python" - <<'PY'
 import numpy as np; print(np.__version__)
@@ -85,6 +90,10 @@ PY
 )"
 echo "torch: $("$VENV/bin/python" - <<'PY'
 import torch; print(torch.__version__)
+PY
+)"
+echo "huggingface_hub: $("$VENV/bin/python" - <<'PY'
+import huggingface_hub as h; print(h.__version__)
 PY
 )"
 
