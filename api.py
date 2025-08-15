@@ -1,202 +1,78 @@
+
 import io
 import os
 import math
 import logging
-from typing import Optional, Tuple
 from dataclasses import dataclass
-
-from flask import Flask, request, jsonify, send_file
-from PIL import Image, ImageOps
-import requests
+from typing import Optional, Tuple, List
 
 import torch
-from diffusers import (
-    StableDiffusionXLPipeline,
-    StableDiffusionXLImg2ImgPipeline,  # << usamos esto como refiner
-    DPMSolverMultistepScheduler,
-    EulerAncestralDiscreteScheduler,
-    AutoencoderKL,
-)
+from flask import Flask, request, jsonify, send_file
+from PIL import Image, ImageOps, ImageFile
 
-# ---- opcionales ----
-HAS_REMBG = True
-try:
-    from rembg import remove as rembg_remove, new_session as rembg_new_session
-    _rembg_session = rembg_new_session("u2net")
-except Exception:
-    HAS_REMBG = False
-    _rembg_session = None
-
-# ---- IP-Adapter FaceID vendorizado (opcional) ----
-HAS_FACEID = False
-try:
-    # requiere que tu repo tenga /IP-Adapter/ip_adapter/*
-    from ip_adapter.ip_adapter_faceid import IPAdapterFaceID  # type: ignore
-    HAS_FACEID = True
-except Exception:
-    HAS_FACEID = False
-
-logging.basicConfig(level=logging.INFO)
+# ------------- Logging -------------
 log = logging.getLogger("api")
+logging.basicConfig(level=logging.INFO, format="%(levelname)s:api:%(message)s")
+log.setLevel(logging.INFO)
 
+# ------------- Env / Defaults -------------
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 DTYPE = torch.float16 if DEVICE == "cuda" else torch.float32
 
 MODEL_NAME = os.getenv("SDXL_MODEL", "SG161222/RealVisXL_V4.0")
 REFINER_NAME = os.getenv("SDXL_REFINER", "stabilityai/stable-diffusion-xl-refiner-1.0")
-USE_REFINER = os.getenv("USE_REFINER", "1") == "1"
-
-# VAE compartido para base y refiner
 SDXL_VAE = os.getenv("SDXL_VAE", "madebyollin/sdxl-vae-fp16-fix")
 
-# pesos FaceID (opcional)
-FACEID_CKPT = os.getenv(
-    "FACEID_CKPT",
-    "/workspace/models/ipadapter/ip-adapter-faceid_sdxl.bin",
+# FaceID adapter (ya lo tienes en disco)
+FACEID_ADAPTER_PATH = os.getenv("FACEID_ADAPTER_PATH", "/srv/app/models/ip-adapter-faceid_sdxl.bin")
+# Adapter de composición (pose/encuadre)
+COMPOSE_ADAPTER_REPO = os.getenv("COMPOSE_ADAPTER_REPO", "h94/IP-Adapter")
+COMPOSE_ADAPTER_SUBMODEL = os.getenv("COMPOSE_ADAPTER_SUBMODEL", "ip-adapter-plus_sdxl_vit-h")
+
+# ------------- Diffusers / Pipelines -------------
+from diffusers import (
+    AutoencoderKL,
+    StableDiffusionXLPipeline,
+    StableDiffusionXLImg2ImgPipeline,
+    EulerAncestralDiscreteScheduler,
 )
 
-# caches HF
-os.environ.setdefault("HF_HOME", "/workspace/.cache/huggingface")
-os.environ.setdefault("HUGGINGFACE_HUB_CACHE", "/workspace/.cache/huggingface")
+# IP-Adapter util (nuevo de diffusers>=0.24)
+from diffusers.loaders import IPAdapterMixin
 
-app = Flask(__name__)
+# ------------- Robust PIL -------------
+ImageFile.LOAD_TRUNCATED_IMAGES = True
 
-_base: Optional[StableDiffusionXLPipeline] = None
-_img2img: Optional[StableDiffusionXLImg2ImgPipeline] = None
-_faceid: Optional["IPAdapterFaceID"] = None  # type: ignore
+def _fetch_image(url_or_path: str, resize_to: Optional[Tuple[int, int]]=None) -> Image.Image:
+    import requests
+    if not url_or_path:
+        raise ValueError("image_url vacío")
+    if url_or_path.startswith("http://") or url_or_path.startswith("https://"):
+        r = requests.get(url_or_path, timeout=30)
+        r.raise_for_status()
+        img = Image.open(io.BytesIO(r.content))
+    else:
+        img = Image.open(url_or_path)
 
+    if img.mode in ("P", "LA", "L"):
+        img = img.convert("RGBA")
+    elif img.mode not in ("RGB", "RGBA"):
+        img = img.convert("RGBA")
 
+    if resize_to is not None:
+        img = img.resize(resize_to, Image.LANCZOS)
+    return img
 
-_vae = None
-def _load_vae():
-    global _vae
-    if _vae is None:
-        log.info(f"⏳ Cargando VAE: {SDXL_VAE}")
-        try:
-            _vae_local = AutoencoderKL.from_pretrained(SDXL_VAE, torch_dtype=DTYPE)
-        except Exception as e:
-            log.warning(f"No se pudo cargar VAE {SDXL_VAE}: {e}. Usando el del checkpoint.")
-            _vae_local = None
-        if _vae_local is not None and DEVICE == "cuda":
-            _vae_local = _vae_local.to(DEVICE)
-        _vae = _vae_local
-        log.info("✔ VAE listo")
-    return _vae
-def _load_base() -> StableDiffusionXLPipeline:
-    global _base
-    if _base is None:
-        log.info(f"⏳ Cargando SDXL base: {MODEL_NAME} (device={DEVICE})")
-        pipe = StableDiffusionXLPipeline.from_pretrained(MODEL_NAME, torch_dtype=DTYPE, use_safetensors=True, variant="fp16", vae=_load_vae())
-        pipe.scheduler = EulerAncestralDiscreteScheduler.from_config(pipe.scheduler.config)
-        if DEVICE == "cuda":
-            pipe.enable_model_cpu_offload()
-            pipe.enable_vae_tiling()
-        _base = pipe
-        log.info("✔ txt2img listo")
-    return _base
-
-
-def _load_img2img() -> StableDiffusionXLImg2ImgPipeline:
-    global _img2img
-    if _img2img is None:
-        log.info(f"⏳ Cargando SDXL img2img / refiner: {REFINER_NAME} (device={DEVICE})")
-        p = StableDiffusionXLImg2ImgPipeline.from_pretrained(REFINER_NAME, torch_dtype=DTYPE, use_safetensors=True, variant="fp16", vae=_load_vae())
-        p.scheduler = EulerAncestralDiscreteScheduler.from_config(p.scheduler.config)
-        if DEVICE == "cuda":
-            p.enable_model_cpu_offload()
-            p.enable_vae_tiling()
-        _img2img = p
-        log.info("✔ img2img listo")
-    return _img2img
-
-
-def _load_faceid_adapter(base_pipe: StableDiffusionXLPipeline) -> Optional["IPAdapterFaceID"]:
-    global _faceid
-    if not HAS_FACEID:
-        return None
-    if not os.path.isfile(FACEID_CKPT):
-        log.warning("FACEID ckpt no encontrado; ignorando FaceID.")
-        return None
-    if _faceid is None:
-        try:
-            _faceid = IPAdapterFaceID(base_pipe, FACEID_CKPT, device=DEVICE)
-            log.info("✔ IP-Adapter FaceID listo")
-        except Exception as e:
-            log.warning(f"No pude inicializar FaceID: {e}")
-            _faceid = None
-    return _faceid
-
-
-def _fetch_image(url: str, size: Tuple[int, int]) -> Image.Image:
-    r = requests.get(url, timeout=30)
-    r.raise_for_status()
-    img = Image.open(io.BytesIO(r.content)).convert("RGB")
-    # rellenamos/crop cuadrado simple para SDXL
-    img = ImageOps.contain(img, size, method=Image.LANCZOS)
-    bg = Image.new("RGB", size, (255, 255, 255))
-    bg.paste(img, ((size[0] - img.width) // 2, (size[1] - img.height) // 2))
-    return bg
-
-
-REALISM_ADD = (
-    "ultra realistic, photorealistic, 8k, professional studio photography, "
-    "natural skin texture, detailed pores, lifelike hair, accurate facial proportions, "
-    "soft diffused lighting, sharp focus on eyes, subtle depth of field, "
-    "no cgi, no 3d render, no cartoon"
-)
-
-REALISM_NEG = (
-    "cgi, 3d render, cartoon, illustration, painting, plastic skin, waxy skin, "
-    "over-smooth, over-sharpen, low quality, artifacts, text, watermark, extra fingers, "
-    "cropped face, disfigured, deformed"
-)
-
-
-def _compose_prompts(prompt: str, negative_prompt: str) -> Tuple[str, str]:
-    p = f"{prompt}, {REALISM_ADD}" if prompt else REALISM_ADD
-    n = f"{negative_prompt}, {REALISM_NEG}" if negative_prompt else REALISM_NEG
-    # evitar que se pase de largo (SDXL CLIP-1 tiene límite ~77 tokens)
-    return p[:1800], n[:1800]
-
-
-def _maybe_transparent(img: Image.Image, make_transparent: bool) -> Image.Image:
-    if not make_transparent:
+def _maybe_transparent(img: Image.Image, transparent: bool) -> Image.Image:
+    if not transparent:
         return img
-    if not HAS_REMBG:
-        return img
-    try:
-        out = rembg_remove(img, session=_rembg_session)
-        return out
-    except Exception as e:
-        log.warning(f"rembg falló: {e}")
-        return img
+    if img.mode != "RGBA":
+        img = img.convert("RGBA")
+    # recorta fondo liso si lo hay
+    bg = Image.new("RGBA", img.size, (0,0,0,0))
+    return Image.alpha_composite(bg, img)
 
-
-def _to_response(img: Image.Image, as_bytes: bool, fmt: str = "PNG"):
-    buf = io.BytesIO()
-    fmt = (fmt or "PNG").upper()
-    save_kwargs = {}
-    if fmt == "JPEG":
-        save_kwargs.update({"quality": 92, "optimize": True})
-    img.save(buf, format=fmt, **save_kwargs)
-    buf.seek(0)
-    if as_bytes:
-        return buf  # el caller devuelve JSON con tamaño; o binario si ?format=png
-    return send_file(buf, mimetype=f"image/{fmt.lower()}")
-
-
-@app.get("/health")
-def health():
-    return jsonify({
-        "ok": True,
-        "device": DEVICE,
-        "model": MODEL_NAME,
-        "use_refiner": USE_REFINER,
-        "has_rembg": HAS_REMBG,
-        "has_faceid": HAS_FACEID and os.path.isfile(FACEID_CKPT),
-    })
-
-
+# ------------- Params -------------
 @dataclass
 class GenParams:
     prompt: str
@@ -207,58 +83,220 @@ class GenParams:
     guidance: float
     seed: Optional[int]
     transparent: bool
-    ret_bytes: bool
-    image_url: Optional[str]
-    strength: float
-    identity_strength: float
+    # FaceID
+    image_url: Optional[str] = None
+    identity_strength: Optional[float] = None
+    strength: Optional[float] = None
+    # Composition / Pose
+    pose_image_url: Optional[str] = None
+    pose_weight: Optional[float] = None
 
+# ------------- Global state -------------
+_base_pipe: Optional[StableDiffusionXLPipeline] = None
+_refiner: Optional[StableDiffusionXLImg2ImgPipeline] = None
+_loaded_faceid: bool = False
+_loaded_compose: bool = False
 
-def _parse_json() -> GenParams:
-    j = request.get_json(force=True, silent=True) or {}
-    return GenParams(
-        prompt=j.get("prompt", ""),
-        negative_prompt=j.get("negative_prompt", ""),
-        width=int(j.get("width", 1024)),
-        height=int(j.get("height", 1024)),
-        steps=int(j.get("steps", 45)),
-        guidance=float(j.get("guidance", 5.5)),
-        seed=j.get("seed", None),
-        transparent=bool(j.get("transparent", False)),
-        ret_bytes=j.get("return", "").lower() == "bytes",
-        image_url=j.get("image_url"),
-        strength=float(j.get("strength", 0.20)),
-        identity_strength=float(j.get("identity_strength", 0.85)),
+def _load_vae():
+    vae = AutoencoderKL.from_pretrained(SDXL_VAE, torch_dtype=DTYPE)
+    if DEVICE == "cuda":
+        vae = vae.to(DEVICE)
+    return vae
+
+def _load_base() -> StableDiffusionXLPipeline:
+    global _base_pipe
+    if _base_pipe is not None:
+        return _base_pipe
+    log.info(f"⏳ Cargando base SDXL: {MODEL_NAME}")
+    vae = _load_vae()
+    pipe = StableDiffusionXLPipeline.from_pretrained(
+        MODEL_NAME,
+        torch_dtype=DTYPE,
+        use_safetensors=True,
+        variant="fp16" if DTYPE == torch.float16 else None,
+        vae=vae,
     )
+    # Scheduler recomendado para RealVis
+    pipe.scheduler = EulerAncestralDiscreteScheduler.from_config(pipe.scheduler.config)
+    pipe.enable_vae_tiling()
+    if DEVICE == "cuda":
+        pipe = pipe.to(DEVICE)
+    _base_pipe = pipe
+    return pipe
 
+def _load_refiner() -> StableDiffusionXLImg2ImgPipeline:
+    global _refiner
+    if _refiner is not None:
+        return _refiner
+    log.info(f"⏳ Cargando refiner: {REFINER_NAME}")
+    vae = _load_vae()  # compartir VAE
+    p = StableDiffusionXLImg2ImgPipeline.from_pretrained(
+        REFINER_NAME,
+        torch_dtype=DTYPE,
+        use_safetensors=True,
+        variant="fp16" if DTYPE == torch.float16 else None,
+        vae=vae,
+    )
+    p.scheduler = EulerAncestralDiscreteScheduler.from_config(p.scheduler.config)
+    p.enable_vae_tiling()
+    if DEVICE == "cuda":
+        p = p.to(DEVICE)
+    _refiner = p
+    return p
 
-def _apply_refiner_if_needed(img: Image.Image, prompt: str, negative_prompt: str, steps: int, guidance: float) -> Image.Image:
-    if not USE_REFINER:
+# ------------- IP-Adapter loaders -------------
+def _load_faceid_adapter(pipe: StableDiffusionXLPipeline):
+    global _loaded_faceid
+    if _loaded_faceid:
+        return
+    if not os.path.exists(FACEID_ADAPTER_PATH):
+        log.warning("No se encontró FACEID_ADAPTER_PATH, FaceID deshabilitado.")
+        return
+    # Cargar FaceID
+    pipe.load_ip_adapter(FACEID_ADAPTER_PATH, subfolder=None)
+    _loaded_faceid = True
+    log.info("✔ IP-Adapter FaceID listo")
+
+def _load_compose_adapter(pipe: StableDiffusionXLPipeline):
+    global _loaded_compose
+    if _loaded_compose:
+        return
+    # Cargar adapter de composición (encuadre/pose) desde repo
+    try:
+        pipe.load_ip_adapter(COMPOSE_ADAPTER_REPO, subfolder=COMPOSE_ADAPTER_SUBMODEL)
+        _loaded_compose = True
+        log.info(f"✔ IP-Adapter Composition listo ({COMPOSE_ADAPTER_SUBMODEL})")
+    except Exception as e:
+        log.warning(f"No se pudo cargar Composition adapter: {e}")
+
+# ------------- Prompt helpers -------------
+def _compose_prompts(p: Optional[str], n: Optional[str]) -> Tuple[str, str]:
+    base_p = (p or "").strip()
+    base_n = (n or "").strip()
+    return base_p, base_n
+
+# ------------- Refiner -------------
+def _apply_refiner_if_needed(img: Image.Image, prompt: str, negative: str, steps: int, guidance: float) -> Image.Image:
+    try:
+        refiner = _load_refiner()
+    except Exception:
         return img
-    ref = _load_img2img()
-    p, n = _compose_prompts(prompt, negative_prompt)
+    # refiner suave
+    strength = 0.10
     with torch.inference_mode():
-        out = ref(
-            prompt=p,
-            negative_prompt=n,
+        out = refiner(
+            prompt=prompt,
+            negative_prompt=negative,
             image=img,
-            strength=0.10,       # refinado suave
-            num_inference_steps=max(10, steps // 2),
+            num_inference_steps=max(steps // 2, 15),
             guidance_scale=guidance,
+            strength=strength,
         )
     return out.images[0]
 
+# ------------- Embeddings helpers -------------
+def _get_faceid_embeds(pipe: StableDiffusionXLPipeline, image: Image.Image):
+    # diffusers reciente expone get_faceid_embeds via pipe.ip_adapter
+    try:
+        return pipe.get_ip_adapter_embedder("face_id").get_image_embeds(image).to(DEVICE, DTYPE)
+    except Exception:
+        # fallback a API genérica del primer adapter cargado
+        try:
+            return pipe.get_ip_adapter_image_embeds(image).to(DEVICE, DTYPE)
+        except Exception as e:
+            log.warning(f"FaceID embeds fallo: {e}")
+            return None
 
-def _txt2img(params: GenParams) -> Image.Image:
-    base = _load_base()
-    p, n = _compose_prompts(params.prompt, params.negative_prompt)
+def _get_compose_embeds(pipe: StableDiffusionXLPipeline, image: Image.Image):
+    try:
+        return pipe.get_ip_adapter_embedder("image").get_image_embeds(image).to(DEVICE, DTYPE)
+    except Exception:
+        try:
+            return pipe.get_ip_adapter_image_embeds(image).to(DEVICE, DTYPE)
+        except Exception as e:
+            log.warning(f"Compose embeds fallo: {e}")
+            return None
+
+# ------------- Core FaceID + Composition -------------
+def _edit_with_faceid_and_pose(params: GenParams) -> Optional[Image.Image]:
+    pipe = _load_base()
+    _load_faceid_adapter(pipe)
+    _load_compose_adapter(pipe)  # opcional, si falla sólo usamos FaceID
+
+    if not params.image_url:
+        return None
+
+    # Cargar referencia de identidad (RGB)
+    src = _fetch_image(params.image_url)
+    if src.mode == "RGBA":
+        src_rgb = src.convert("RGB")
+    else:
+        src_rgb = src.convert("RGB")
+
+    # Embeddings FaceID
+    face_embeds = _get_faceid_embeds(pipe, src_rgb)
+    if face_embeds is None:
+        log.warning("faceid_embeds=None; abortando FaceID.")
+        return None
+
+    # Embeddings de composición (opcional)
+    compose_embeds = None
+    pose_weight = float(params.pose_weight or 0.6)
+    if params.pose_image_url:
+        try:
+            pose_img = _fetch_image(params.pose_image_url, (params.width, params.height) if params.width and params.height else None)
+            if pose_img.mode == "RGBA":
+                pose_img = pose_img.convert("RGB")
+            compose_embeds = _get_compose_embeds(pipe, pose_img)
+        except Exception as e:
+            log.warning(f"No pude usar pose_image_url: {e}")
+
+    identity = float(params.identity_strength or 0.9)
+    face_scale = max(0.1, min(1.5, 0.6 + identity * 0.6))  # 0.6–1.5 aprox
+    log.info(f"➡️ FaceID | identity={identity:.2f} (scale={face_scale:.2f})  Pose weight={pose_weight:.2f}")
+
     g = None
     if params.seed is not None:
         g = torch.Generator(device=DEVICE).manual_seed(int(params.seed))
-    log.info(f"➡️ Txt2Img | steps={params.steps} guide={params.guidance:.2f} size={params.width}x{params.height} transparent={params.transparent} seed={params.seed}")
+
+    ptxt, ntxt = _compose_prompts(params.prompt, params.negative_prompt)
+
+    # Construir lista de embeds y scales
+    embeds_list: List[torch.Tensor] = [face_embeds]
+    scales: List[float] = [face_scale]
+    if compose_embeds is not None:
+        embeds_list.append(compose_embeds)
+        scales.append(float(pose_weight))
+
     with torch.inference_mode():
-        out = base(
-            prompt=p,
-            negative_prompt=n,
+        out = pipe(
+            prompt=ptxt,
+            negative_prompt=ntxt,
+            ip_adapter_image_embeds=embeds_list,
+            ip_adapter_scale=scales,
+            width=params.width,
+            height=params.height,
+            num_inference_steps=params.steps,
+            guidance_scale=params.guidance,
+            generator=g,
+        )
+
+    img = out.images[0]
+    img = _apply_refiner_if_needed(img, ptxt, ntxt, params.steps, params.guidance)
+    img = _maybe_transparent(img, params.transparent)
+    return img
+
+# ------------- Plain txt2img -------------
+def _txt2img(params: GenParams) -> Image.Image:
+    pipe = _load_base()
+    ptxt, ntxt = _compose_prompts(params.prompt, params.negative_prompt)
+    g = None
+    if params.seed is not None:
+        g = torch.Generator(device=DEVICE).manual_seed(int(params.seed))
+    with torch.inference_mode():
+        out = pipe(
+            prompt=ptxt,
+            negative_prompt=ntxt,
             width=params.width,
             height=params.height,
             num_inference_steps=params.steps,
@@ -266,145 +304,55 @@ def _txt2img(params: GenParams) -> Image.Image:
             generator=g,
         )
     img = out.images[0]
-    img = _apply_refiner_if_needed(img, p, n, params.steps, params.guidance)
-    img = _maybe_transparent(img, params.transparent)
-    return img
-
-
-
-def _edit_with_faceid(params: GenParams) -> Optional[Image.Image]:
-    """FaceID con embeddings explícitos: evita errores internos del adapter.generate."""
-    base = _load_base()
-    adapter = _load_faceid_adapter(base)
-    if adapter is None:
-        return None
-
-    # 1) Cargar imagen de referencia y normalizar a RGB
-    try:
-        src = _fetch_image(params.image_url, (params.width, params.height))
-    except Exception as e:
-        log.warning(f"No pude descargar image_url: {e}")
-        return None
-
-    if src.mode not in ("RGB", "RGBA"):
-        src = src.convert("RGB")
-    elif src.mode == "RGBA":
-        # Para FaceID, mejor pasar RGB (sin alpha) para embeddings
-        src = src.convert("RGB")
-
-    ptxt, ntxt = _compose_prompts(params.prompt, params.negative_prompt)
-    g = None
-    if params.seed is not None:
-        g = torch.Generator(device=DEVICE).manual_seed(int(params.seed))
-
-    # 2) Calcular embeddings FaceID de forma explícita
-    try:
-        if hasattr(adapter, "get_faceid_embeds"):
-            embeds = adapter.get_faceid_embeds(src)
-        else:
-            # Método alternativo usado en algunas variantes del adapter
-            embeds = adapter.compute_embeds(src)
-    except Exception as e:
-        log.warning(f"No se pudo calcular faceid_embeds: {e}")
-        return None
-
-    if embeds is None:
-        log.warning("faceid_embeds=None (¿no se detectó rostro válido en la referencia?).")
-        return None
-
-    # 3) Escala/identidad
-    identity = float(params.identity_strength or 0.9)
-    faceid_scale = max(0.1, min(1.5, 0.6 + identity * 0.6))  # 0.6–1.5 aprox
-    img_w, img_h = params.width, params.height
-    log.info(f"➡️ FaceID | identity={identity:.2f} (scale={faceid_scale:.2f}) strength={params.strength:.2f}")
-
-    # 4) Generar con la pipeline base, inyectando los embeddings explícitos
-    with torch.inference_mode():
-        out = base(
-            prompt=ptxt,
-            negative_prompt=ntxt,
-            image=src,
-            ip_adapter_image_embeds=embeds,
-            width=img_w,
-            height=img_h,
-            num_inference_steps=params.steps,
-            guidance_scale=params.guidance,
-            generator=g,
-        )
-    img = out.images[0]
-
-    # 5) Refiner y transparencia (en el output)
     img = _apply_refiner_if_needed(img, ptxt, ntxt, params.steps, params.guidance)
     img = _maybe_transparent(img, params.transparent)
     return img
 
+# ------------- Flask -------------
+app = Flask(__name__)
 
+def _parse_params(js: dict) -> GenParams:
+    return GenParams(
+        prompt=js.get("prompt", ""),
+        negative_prompt=js.get("negative_prompt", ""),
+        width=int(js.get("width", 1024)),
+        height=int(js.get("height", 1024)),
+        steps=int(js.get("steps", 45)),
+        guidance=float(js.get("guidance", 5.5)),
+        seed=js.get("seed", None),
+        transparent=bool(js.get("transparent", False)),
+        image_url=js.get("image_url"),
+        identity_strength=js.get("identity_strength", 0.9),
+        strength=js.get("strength", 0.15),
+        pose_image_url=js.get("pose_image_url"),
+        pose_weight=js.get("pose_weight", 0.6),
+    )
 
-def _img2img_plain(params: GenParams) -> Optional[Image.Image]:
-    """Fallback cuando no hay FaceID: simple img2img para preservar identidad."""
-    src = _fetch_image(params.image_url, (params.width, params.height))
-    p, n = _compose_prompts(params.prompt, params.negative_prompt)
-    g = None
-    if params.seed is not None:
-        g = torch.Generator(device=DEVICE).manual_seed(int(params.seed))
-
-    pipe = _load_img2img()
-    strength = max(0.05, min(0.6, params.strength))  # bajo para preservar rasgos
-    log.info(f"➡️ Img2Img | strength={strength:.2f}")
-    with torch.inference_mode():
-        out = pipe(
-            prompt=p,
-            negative_prompt=n,
-            image=src,
-            strength=strength,
-            num_inference_steps=params.steps,
-            guidance_scale=params.guidance,
-            generator=g,
-        )
-    img = out.images[0]
-    img = _maybe_transparent(img, params.transparent)
-    return img
-
-
-@app.post("/generate")
+@app.route("/generate", methods=["POST"])
 def generate():
-    """
-    JSON:
-    {
-      "prompt": "...",
-      "negative_prompt": "...",
-      "width": 1024, "height": 1024,
-      "steps": 30, "guidance": 7.5,
-      "seed": 42,
-      "transparent": true,
-      "image_url": "https://.../headshot.png",    # opcional
-      "strength": 0.20,                           # img2img / FaceID variación
-      "identity_strength": 0.90,                  # FaceID: 0..1 (más = más parecido)
-      "return": "bytes"                           # si quieres binario en JSON (tamaño)
-    }
-    """
     try:
-        params = _parse_json()
+        js = request.get_json(force=True, silent=False)
+        params = _parse_params(js)
 
         if params.image_url:
-            # FaceID si disponible; si falla, plain img2img
-            img = _edit_with_faceid(params)
+            img = _edit_with_faceid_and_pose(params)
             if img is None:
-                img = _img2img_plain(params)
+                img = _txt2img(params)
         else:
             img = _txt2img(params)
 
-        # ¿Retorno como bytes o respuesta HTTP image/png?
-        fmt = request.args.get("format", "png")
-        if params.ret_bytes:
-            blob = _to_response(img, as_bytes=True, fmt=fmt)
-            return jsonify({"ok": True, "bytes": len(blob.getvalue()), "seed": params.seed})
-        else:
-            return _to_response(img, as_bytes=False, fmt=fmt)
+        buf = io.BytesIO()
+        fmt = "PNG" if params.transparent else "JPEG"
+        img.save(buf, format=fmt)
+        buf.seek(0)
+        return send_file(buf, mimetype=f"image/{fmt.lower()}")
     except Exception as e:
         log.exception("generate falló")
         return jsonify({"ok": False, "error": str(e)}), 500
 
+@app.route("/health", methods=["GET"])
+def health():
+    return jsonify({"ok": True, "model": MODEL_NAME, "device": DEVICE})
 
 if __name__ == "__main__":
-    app.run("0.0.0.0", 3000, debug=False)
+    app.run(host="0.0.0.0", port=3000, debug=False)
