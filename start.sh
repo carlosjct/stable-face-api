@@ -10,56 +10,31 @@ PORT="${PORT:-3000}"
 echo "== Boot =="
 python3 --version || true
 
-# 1) VENV + pip
+# 1) venv + pip
 if [[ ! -x "$VENV/bin/python" ]]; then
-  echo ">> creating venv at $VENV"
   python3 -m venv "$VENV"
 fi
 source "$VENV/bin/activate"
 python -m pip install --upgrade pip wheel setuptools
 
-# 2) PyTorch CUDA 11.8 (como ya vienes usando)
+# 2) limpiar posibles restos conflictivos
+pip uninstall -y numpy onnxruntime onnxruntime-gpu || true
+
+# 3) pin estable de NumPy 1.x (compatible con tu stack actual)
+pip install --no-cache-dir "numpy==1.26.4"
+
+# 4) PyTorch CUDA 11.8 (tu versión probada)
 pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cu118 \
   torch==2.0.1+cu118 torchvision==0.15.2+cu118 torchaudio==2.0.2+cu118
 
-# 3) Dependencias del repo (si hay requirements.txt)
-if [[ -f "$APP_DIR/requirements.txt" ]]; then
-  echo ">> installing requirements from $APP_DIR/requirements.txt"
-  pip install --no-cache-dir -r "$APP_DIR/requirements.txt" || true
-elif [[ -f "$ALT_DIR/requirements.txt" ]]; then
-  echo ">> installing requirements from $ALT_DIR/requirements.txt"
-  pip install --no-cache-dir -r "$ALT_DIR/requirements.txt" || true
-fi
-
-# 4) Asegurar rembg[gpu] y onnxruntime-gpu (corrige CPU->GPU si fuese necesario)
-if python -c "import rembg" 2>/dev/null; then
-  echo ">> rembg ya presente"
-else
-  echo ">> installing rembg[gpu]"
-  # quitar onnxruntime CPU si vino desde requirements
-  pip uninstall -y onnxruntime || true
-  pip install --no-cache-dir onnxruntime-gpu==1.16.3
-  pip install --no-cache-dir 'rembg[gpu]==2.0.50'
-fi
-
-# 5) Extras comunes que ya usas
+# 5) resto de deps de la app
 pip install --no-cache-dir \
   diffusers==0.24.0 transformers==4.35.2 huggingface_hub==0.19.4 \
-  accelerate==0.24.1 safetensors==0.3.1 flask gunicorn einops==0.7.0 timm==0.9.16 \
-  opencv-python-headless pillow
+  accelerate==0.24.1 safetensors==0.3.1 flask gunicorn \
+  einops==0.7.0 timm==0.9.16 opencv-python-headless pillow
 
-# 6) Ubicar app dir (prefiere /srv/app)
-if [[ -f "$APP_DIR/api.py" || -f "$APP_DIR/app.py" || -f "$APP_DIR/main.py" ]]; then
-  cd "$APP_DIR"
-elif [[ -f "$ALT_DIR/api.py" || -f "$ALT_DIR/app.py" || -f "$ALT_DIR/main.py" ]]; then
-  cd "$ALT_DIR"
-else
-  echo "❌ No se encontró api.py/app.py/main.py en $APP_DIR ni $ALT_DIR"
-  ls -la "$APP_DIR" || true
-  ls -la "$ALT_DIR" || true
-  exit 1
-fi
-echo ">> APP at: $(pwd)"
+# 6) onnxruntime GPU compatible con numpy 1.26 + rembg GPU
+pip install --no-cache-dir "onnxruntime-gpu==1.15.1" "rembg[gpu]==2.0.50"
 
 # 7) Caches de HF (opcional)
 export HF_HOME="${HF_HOME:-/workspace/.cache/huggingface}"
