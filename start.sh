@@ -57,8 +57,20 @@ PY
 
 # ---------- launch ----------
 cd "$APP_DIR"
+
+# trazas útiles
+echo "PATH=$PATH"
+echo "which python: $(which python)"
+echo "which gunicorn: $(which gunicorn)"
+python - <<'PY'
+import sys, numpy, torch
+print("python:", sys.executable)
+print("numpy:", numpy.__version__)
+print("torch:", torch.__version__)
+PY
+
 MOD=$(ls | grep -E '^(api|app|main)\.py$' | head -n1 | sed 's/\.py$//')
-OBJ=$(python - <<PY
+OBJ=$("$VENV/bin/python" - <<PY
 import importlib.util, pathlib
 p = pathlib.Path("$MOD.py")
 s = importlib.util.spec_from_file_location("$MOD", p)
@@ -72,4 +84,6 @@ if [[ -z "$OBJ" ]]; then
 fi
 
 echo "🚀 arrancando ${MOD}:${OBJ}"
-exec gunicorn -w 1 -k gthread --threads 8 -b "${HOST}:${PORT}" "${MOD}:${OBJ}"
+# MUY IMPORTANTE: usar gunicorn del venv
+exec "$VENV/bin/gunicorn" -w 1 -k gthread --threads 8 -b "${HOST}:${PORT}" "${MOD}:${OBJ}"
+
