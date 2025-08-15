@@ -14,6 +14,8 @@ from diffusers import (
     StableDiffusionXLPipeline,
     StableDiffusionXLImg2ImgPipeline,  # << usamos esto como refiner
     DPMSolverMultistepScheduler,
+    EulerAncestralDiscreteScheduler,
+    AutoencoderKL,
 )
 
 # ---- opcionales ----
@@ -44,6 +46,9 @@ MODEL_NAME = os.getenv("SDXL_MODEL", "SG161222/RealVisXL_V4.0")
 REFINER_NAME = os.getenv("SDXL_REFINER", "stabilityai/stable-diffusion-xl-refiner-1.0")
 USE_REFINER = os.getenv("USE_REFINER", "1") == "1"
 
+# VAE compartido para base y refiner
+SDXL_VAE = os.getenv("SDXL_VAE", "madebyollin/sdxl-vae-fp16-fix")
+
 # pesos FaceID (opcional)
 FACEID_CKPT = os.getenv(
     "FACEID_CKPT",
@@ -61,17 +66,28 @@ _img2img: Optional[StableDiffusionXLImg2ImgPipeline] = None
 _faceid: Optional["IPAdapterFaceID"] = None  # type: ignore
 
 
+
+_vae = None
+def _load_vae():
+    global _vae
+    if _vae is None:
+        log.info(f"⏳ Cargando VAE: {SDXL_VAE}")
+        try:
+            _vae_local = AutoencoderKL.from_pretrained(SDXL_VAE, torch_dtype=DTYPE)
+        except Exception as e:
+            log.warning(f"No se pudo cargar VAE {SDXL_VAE}: {e}. Usando el del checkpoint.")
+            _vae_local = None
+        if _vae_local is not None and DEVICE == "cuda":
+            _vae_local = _vae_local.to(DEVICE)
+        _vae = _vae_local
+        log.info("✔ VAE listo")
+    return _vae
 def _load_base() -> StableDiffusionXLPipeline:
     global _base
     if _base is None:
         log.info(f"⏳ Cargando SDXL base: {MODEL_NAME} (device={DEVICE})")
-        pipe = StableDiffusionXLPipeline.from_pretrained(
-            MODEL_NAME,
-            torch_dtype=DTYPE,
-            use_safetensors=True,
-            variant="fp16",   
-        )
-        pipe.scheduler = DPMSolverMultistepScheduler.from_config(pipe.scheduler.config)
+        pipe = StableDiffusionXLPipeline.from_pretrained(MODEL_NAME, torch_dtype=DTYPE, use_safetensors=True, variant="fp16", vae=_load_vae())
+        pipe.scheduler = EulerAncestralDiscreteScheduler.from_config(pipe.scheduler.config)
         if DEVICE == "cuda":
             pipe.enable_model_cpu_offload()
             pipe.enable_vae_tiling()
@@ -84,13 +100,8 @@ def _load_img2img() -> StableDiffusionXLImg2ImgPipeline:
     global _img2img
     if _img2img is None:
         log.info(f"⏳ Cargando SDXL img2img / refiner: {REFINER_NAME} (device={DEVICE})")
-        p = StableDiffusionXLImg2ImgPipeline.from_pretrained(
-            REFINER_NAME,
-            torch_dtype=DTYPE,
-            use_safetensors=True,
-            variant="fp16",   
-        )
-        p.scheduler = DPMSolverMultistepScheduler.from_config(p.scheduler.config)
+        p = StableDiffusionXLImg2ImgPipeline.from_pretrained(REFINER_NAME, torch_dtype=DTYPE, use_safetensors=True, variant="fp16", vae=_load_vae())
+        p.scheduler = EulerAncestralDiscreteScheduler.from_config(p.scheduler.config)
         if DEVICE == "cuda":
             p.enable_model_cpu_offload()
             p.enable_vae_tiling()
@@ -209,8 +220,8 @@ def _parse_json() -> GenParams:
         negative_prompt=j.get("negative_prompt", ""),
         width=int(j.get("width", 1024)),
         height=int(j.get("height", 1024)),
-        steps=int(j.get("steps", 30)),
-        guidance=float(j.get("guidance", 7.5)),
+        steps=int(j.get("steps", 45)),
+        guidance=float(j.get("guidance", 5.5)),
         seed=j.get("seed", None),
         transparent=bool(j.get("transparent", False)),
         ret_bytes=j.get("return", "").lower() == "bytes",
@@ -230,7 +241,7 @@ def _apply_refiner_if_needed(img: Image.Image, prompt: str, negative_prompt: str
             prompt=p,
             negative_prompt=n,
             image=img,
-            strength=0.15,       # refinado suave
+            strength=0.10,       # refinado suave
             num_inference_steps=max(10, steps // 2),
             guidance_scale=guidance,
         )
